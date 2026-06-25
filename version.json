@@ -1,0 +1,6 @@
+{
+  "version": "1.0.0",
+  "py_url": "https://raw.githubusercontent.com/rodrigooa43-create/OpenBionica/main/EEG_Data_Collector.py",
+  "sha256": "0a74498be7c2a4c5bff88a6d1f0819e31cb00c75821151c424abfa74785a1fec",
+  "changelog": "Versao inicial 1.0.0 - coleta EEG, analises (FFT/bandas/ERS-ERD), correcao FCz"
+}
