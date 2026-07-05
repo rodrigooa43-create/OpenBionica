@@ -1,7 +1,7 @@
 """
 EEG_Data_Collector.py — Lime Edition (com suporte ao módulo de expansão 16 canais)
 ================================================================================
-Aplicação 100% Python (PyQt6 + pyqtgraph + scipy + numpy) para coleta e análise
+Aplicação 100% Python (PySide6 + pyqtgraph + scipy + numpy) para coleta e análise
 de sinais EEG em tempo real. Inspirada em interfaces clássicas de aquisição EEG, com identidade
 própria (tema dark + verde-limao).
 
@@ -34,22 +34,31 @@ Uso:
 """
 
 import csv
+import difflib
 import hashlib
 import json
+import logging
+import logging.handlers
+import math
 import os
+import re
 import secrets
 import socket
 import sys
 import time
+import traceback
+import unicodedata
 from collections import deque
 from datetime import datetime
 
 import numpy as np
+# Garante que o pyqtgraph use o MESMO binding Qt do app (PySide6, LGPL)
+os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
 import pyqtgraph as pg
 import serial
 import serial.tools.list_ports
-from PyQt6 import QtCore, QtGui, QtWidgets
-from PyQt6.QtCore import QThread, QTimer, pyqtSignal
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import QThread, QTimer, Signal
 from scipy import signal as scipy_signal
 from scipy.fft import rfft, rfftfreq
 
@@ -231,6 +240,17 @@ THEMES = {
         "error":       "#ff3355", "warning":     "#ffaa00",
         "expansion":   "#66bbff",
         "table_bg":    "#1a1a1a", "table_alt":   "#252525",
+    },
+    "Claro Clinico": {
+        # Tema claro clinico (Proposta 2): superficies brancas, acento
+        # verde-azulado profissional, cinzas neutros e bordas sutis.
+        "background":  "#f7f9fb", "surface":     "#ffffff",
+        "surface_alt": "#f1f4f8", "border":      "#dbe1ea",
+        "text":        "#1a2230", "text_dim":    "#5b6473",
+        "accent":      "#0f9d75", "accent_dim":  "#0c7f5f",
+        "error":       "#d4364f", "warning":     "#c77700",
+        "expansion":   "#2563c9",
+        "table_bg":    "#ffffff", "table_alt":   "#eef4f1",
     },
     "Claro (white)": {
         "background":  "#fafafa", "surface":     "#ffffff",
@@ -740,8 +760,13 @@ def tr(s):
 class AppConfig:
     def __init__(self, path=CONFIG_PATH):
         self.path = path
-        self.theme = "Lime (verde-limao)"
+        self.theme = "Claro Clinico"
         self.language = "pt"  # pt / en / es
+        # Aceite do Termo de Uso (assistente de primeiro uso)
+        self.terms_accepted    = False
+        self.terms_version     = ""
+        self.terms_accepted_at = ""    # ISO-8601 local
+        self.first_run_done    = False
         self.channel_mapping = list(DEFAULT_MAPPING)
         # Tipo de sinal por canal — Bionica Lab board é multimodal.
         # CH 1-8: EEG por padrão; CH 9-16: EMG por padrão (alvo músculo
@@ -803,6 +828,13 @@ class AppConfig:
             lang = d.get("language", self.language)
             if isinstance(lang, str) and lang in ("pt", "en", "es"):
                 self.language = lang
+            # Aceite do Termo de Uso
+            self.terms_accepted = bool(d.get("terms_accepted", self.terms_accepted))
+            tv = d.get("terms_version", self.terms_version)
+            if isinstance(tv, str): self.terms_version = tv
+            ta = d.get("terms_accepted_at", self.terms_accepted_at)
+            if isinstance(ta, str): self.terms_accepted_at = ta
+            self.first_run_done = bool(d.get("first_run_done", self.first_run_done))
             mapping = d.get("channel_mapping", self.channel_mapping)
             if isinstance(mapping, list) and len(mapping) == len(DEFAULT_MAPPING):
                 self.channel_mapping = mapping
@@ -853,7 +885,8 @@ class AppConfig:
             self.imp_good_max       = float(d.get("imp_good_max",       self.imp_good_max))
             self.imp_acceptable_max = float(d.get("imp_acceptable_max", self.imp_acceptable_max))
             slots = d.get("layout_slots_cfg")
-            if isinstance(slots, list) and len(slots) == 4:
+            if (isinstance(slots, list) and len(slots) == 4
+                    and all(isinstance(s, dict) for s in slots)):
                 self.layout_slots_cfg = slots
             for key in ("layout_split_h_sizes", "layout_split_left", "layout_split_right"):
                 val = d.get(key)
@@ -863,11 +896,16 @@ class AppConfig:
             print(f"[AppConfig] aviso: não foi possivel ler {self.path}: {exc}")
 
     def save(self):
+        # Serializa ANTES de tocar o arquivo final: um erro de serializacao nao
+        # destroi a config existente.
         try:
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump({
+            data = json.dumps({
                     "theme": self.theme,
                     "language": self.language,
+                    "terms_accepted":    self.terms_accepted,
+                    "terms_version":     self.terms_version,
+                    "terms_accepted_at": self.terms_accepted_at,
+                    "first_run_done":    self.first_run_done,
                     "channel_mapping": self.channel_mapping,
                     "channel_signal_types": self.channel_signal_types,
                     "emg_envelope_method":   self.emg_envelope_method,
@@ -886,9 +924,27 @@ class AppConfig:
                     "layout_split_h_sizes": self.layout_split_h_sizes,
                     "layout_split_left":    self.layout_split_left,
                     "layout_split_right":   self.layout_split_right,
-                }, f, ensure_ascii=False, indent=2)
+                }, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            print(f"[AppConfig] falha serializando config: {exc}")
+            return
+        # Escrita ATOMICA: grava em .tmp, fsync, backup .bak, e os.replace().
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(data); f.flush()
+                try: os.fsync(f.fileno())
+                except Exception: pass
+            if os.path.exists(self.path):
+                try:
+                    import shutil
+                    shutil.copyfile(self.path, self.path + ".bak")
+                except Exception: pass
+            os.replace(tmp, self.path)   # troca atomica (mesmo volume)
         except Exception as exc:
             print(f"[AppConfig] falha salvando {self.path}: {exc}")
+            try: os.remove(tmp)
+            except Exception: pass
 
 
 # ============================================================
@@ -1274,7 +1330,7 @@ ELECTRODE_POSITIONS = [
 # COLORS comeca com o tema default (Lime). Pode ser substituido em runtime
 # via _apply_theme() — dict mutavel para que stylesheet/widgets que já leram
 # as cores continuem funcionando (atualizamos as chaves in-place).
-COLORS = dict(THEMES["Lime (verde-limao)"])
+COLORS = dict(THEMES["Claro Clinico"])
 
 CHANNEL_COLORS = [
     # CH1-8 (paleta original — placa base)
@@ -1316,11 +1372,16 @@ _TRAPEZOID = getattr(np, "trapezoid", None) or getattr(np, "trapz", None)
 # ============================================================
 # Versão e metadados do aplicativo
 # ============================================================
-APP_VERSION = "1.0.0"
-APP_NAME    = "EEG Data Collector"
-APP_EDITION = "Lime Edition"
-APP_AUTHORS = "Bionica Lab / UFES"
+APP_VERSION = "1.1.0"
+APP_NAME       = "OpenBiônica"
+APP_NAME_ASCII = "OpenBionica"   # forma sem acento p/ metadados ASCII (EDF/BIDS)
+APP_EDITION    = "Edição Clínica"
+APP_AUTHORS    = "OpenBiônica"
 APP_YEAR    = 2026
+TERMS_VERSION = "1.0"   # versao do Termo de Uso; bump => assistente reaparece p/ re-aceite
+# Repositorio do codigo (mesmo fluxo do GitHub-pull / version.json) — usado para
+# carimbar PROVENIENCIA nos arquivos gerados (reprodutibilidade/auditoria).
+CODE_URL    = "https://github.com/rodrigooa43-create/OpenBionica"
 
 
 # ============================================================
@@ -1462,6 +1523,20 @@ QSlider::handle:horizontal {{ background: {c['accent']};
 QProgressBar {{ border: 1px solid {c['border']}; border-radius: 3px;
     background: {c['surface_alt']}; text-align: center; color: {c['text']}; }}
 QProgressBar::chunk {{ background: {c['accent']}; }}
+QMenuBar {{ background-color: {c['surface']}; color: {c['text']};
+    border-bottom: 1px solid {c['border']}; }}
+QMenuBar::item {{ background: transparent; padding: 5px 11px; }}
+QMenuBar::item:selected {{ background: {c['surface_alt']}; color: {c['accent']};
+    border-radius: 4px; }}
+QMenu {{ background-color: {c['surface']}; color: {c['text']};
+    border: 1px solid {c['border']}; padding: 4px; }}
+QMenu::item {{ padding: 6px 22px; border-radius: 4px; }}
+QMenu::item:selected {{ background-color: {c['accent_dim']}; color: {c['background']}; }}
+QStatusBar {{ background-color: {c['surface']}; color: {c['text_dim']};
+    border-top: 1px solid {c['border']}; }}
+QStatusBar::item {{ border: none; }}
+QToolTip {{ background-color: {c['surface_alt']}; color: {c['text']};
+    border: 1px solid {c['border']}; padding: 4px 6px; }}
 """
 
 
@@ -1757,14 +1832,638 @@ class LSLSender:
 
 
 # ============================================================
+# AutoStats — FACILITADOR estatístico: escolhe o teste sozinho
+# ============================================================
+# Objetivo: o usuário (clínico/estudante) NÃO precisa saber qual teste usar.
+# O fluxo padrão da literatura é automatizado: descritivas -> normalidade
+# (Shapiro) -> paramétrico/não-paramétrico -> tamanho de efeito -> correção de
+# múltiplas comparações (Holm) -> conclusão em linguagem simples.
+def _stat_descr(vals):
+    a = np.asarray([v for v in vals if v is not None and np.isfinite(v)], float)
+    if a.size == 0:
+        return {"n": 0, "mean": float("nan"), "sd": float("nan"),
+                "median": float("nan"), "iqr": float("nan")}
+    return {"n": int(a.size), "mean": float(np.mean(a)),
+            "sd": float(np.std(a, ddof=1)) if a.size > 1 else 0.0,
+            "median": float(np.median(a)),
+            "iqr": float(np.subtract(*np.percentile(a, [75, 25])))}
+
+
+def _cohen_d(a, b):
+    a = np.asarray(a, float); b = np.asarray(b, float)
+    na, nb = len(a), len(b)
+    if na < 2 or nb < 2:
+        return float("nan")
+    sp = np.sqrt(((na - 1) * np.var(a, ddof=1) + (nb - 1) * np.var(b, ddof=1))
+                 / (na + nb - 2))
+    return float((np.mean(a) - np.mean(b)) / sp) if sp > 0 else float("nan")
+
+
+def _effect_mag(d):
+    d = abs(d)
+    if not np.isfinite(d):
+        return "—"
+    if d < 0.2: return "desprezível"
+    if d < 0.5: return "pequeno"
+    if d < 0.8: return "médio"
+    return "grande"
+
+
+def auto_compare(groups, names=None, paired=False, alpha=0.05):
+    """Escolhe e roda o teste estatístico adequado automaticamente.
+    `groups`: lista de sequências numéricas (2 ou mais grupos)."""
+    import scipy.stats as st
+    arrs = [np.asarray([v for v in g if v is not None and np.isfinite(v)], float)
+            for g in groups]
+    names = names or [f"Grupo {i + 1}" for i in range(len(arrs))]
+    res = {"names": names, "descr": [_stat_descr(g) for g in arrs], "alpha": alpha,
+           "test": "—", "stat": float("nan"), "p": float("nan"),
+           "effect_name": "—", "effect": float("nan"),
+           "normal": None, "ok": False, "note": ""}
+    if any(a.size < 2 for a in arrs):
+        res["note"] = "amostra insuficiente (n<2 em algum grupo)"
+        return res
+
+    def _is_normal(a):
+        if a.size < 3:
+            return True
+        try:
+            return float(st.shapiro(a).pvalue) > 0.05
+        except Exception:
+            return True
+    all_normal = all(_is_normal(a) for a in arrs)
+    res["normal"] = bool(all_normal)
+    try:
+        if len(arrs) == 2:
+            a, b = arrs
+            if paired:
+                n = min(len(a), len(b)); a, b = a[:n], b[:n]
+                # No teste pareado o pressuposto e a normalidade das DIFERENCAS
+                # d = a - b, nao de cada grupo isolado.
+                diff = a - b
+                paired_normal = _is_normal(diff)
+                res["normal"] = bool(paired_normal)
+                if paired_normal:
+                    s, p = st.ttest_rel(a, b); res["test"] = "t de Student (pareado)"
+                    sd = np.std(diff, ddof=1)
+                    res["effect"] = float(np.mean(diff) / sd) if sd > 0 else float("nan")
+                    res["effect_name"] = "Cohen dz"
+                else:
+                    s, p = st.wilcoxon(a, b); res["test"] = "Wilcoxon (pareado)"
+                    res["effect_name"] = "r"
+            else:
+                if all_normal:
+                    s, p = st.ttest_ind(a, b, equal_var=False)
+                    res["test"] = "t de Welch (independente)"
+                    res["effect"] = _cohen_d(a, b); res["effect_name"] = "Cohen d"
+                else:
+                    s, p = st.mannwhitneyu(a, b, alternative="two-sided")
+                    res["test"] = "Mann-Whitney U"; res["effect_name"] = "r"
+            res["stat"] = float(s); res["p"] = float(p)
+        else:
+            if all_normal:
+                s, p = st.f_oneway(*arrs); res["test"] = "ANOVA (1 fator)"
+            else:
+                s, p = st.kruskal(*arrs); res["test"] = "Kruskal-Wallis"
+            res["stat"] = float(s); res["p"] = float(p)
+        res["ok"] = True
+    except Exception as exc:
+        res["note"] = f"falha no teste: {exc}"
+    return res
+
+
+def holm_correction(pvals):
+    """Holm-Bonferroni: p-valores ajustados (mantém a ordem de entrada)."""
+    p = np.asarray(pvals, float)
+    order = np.argsort(np.where(np.isfinite(p), p, np.inf))
+    m = int(np.sum(np.isfinite(p)))
+    adj = np.full_like(p, np.nan)
+    running, rank = 0.0, 0
+    for idx in order:
+        if not np.isfinite(p[idx]):
+            continue
+        rank += 1
+        running = max(running, (m - rank + 1) * float(p[idx]))
+        adj[idx] = min(running, 1.0)
+    return adj.tolist()
+
+
+def interpret_result(res):
+    """Conclusão em linguagem simples (pt-BR) a partir de auto_compare()."""
+    if not res.get("ok"):
+        return f"Não foi possível concluir: {res.get('note') or 'dados insuficientes'}."
+    p = res["p"]; nm = res["names"]; sig = p < res["alpha"]
+    eff, en = res.get("effect"), res.get("effect_name")
+    txt = (f"{res['test']}: " +
+           ("DIFERENÇA significativa" if sig else "sem diferença significativa") +
+           f" (p = {p:.4f}).")
+    if len(nm) == 2 and sig:
+        d = res["descr"]
+        maior = nm[0] if d[0]["mean"] >= d[1]["mean"] else nm[1]
+        txt += f" Em média, {maior} é maior."
+    if en not in ("—", None) and eff is not None and np.isfinite(eff):
+        txt += f" Efeito ({en}) = {eff:.2f} ({_effect_mag(eff)})."
+    if any(d["n"] < 5 for d in res["descr"]):
+        txt += " ATENÇÃO: amostra pequena (n<5) — interprete com cautela."
+    return txt
+
+
+# ============================================================
+# GuidedStatsDialog — UI do facilitador estatístico
+# ============================================================
+class GuidedStatsDialog(QtWidgets.QDialog):
+    """Compara grupos de sessões (ex.: Antes × Depois) por banda de potência,
+    escolhe o teste sozinho, monta a tabela e explica — sem exigir conhecimento
+    estatístico do usuário."""
+
+    COLS = ["banda", "A", "B", "teste", "p", "p_holm", "efeito", "signif"]
+
+    def __init__(self, main):
+        super().__init__(main)
+        self.main = main
+        self._files = {"A": [], "B": []}
+        self._rows = []
+        self.setWindowTitle("Estatística guiada — comparar grupos")
+        self.resize(860, 580)
+        v = QtWidgets.QVBoxLayout(self)
+        intro = QtWidgets.QLabel(
+            "Selecione as sessões de cada grupo (ex.: <b>Antes</b> × <b>Depois</b>). "
+            "Você pode juntar sessões de <b>vários pacientes</b> no mesmo grupo — "
+            "ex.: o \"antes\" de todos num grupo e o \"depois\" de todos no outro. "
+            "Cada <b>sessão conta como 1 amostra</b>.<br>"
+            "<b>Regra:</b> cada grupo precisa de <b>≥ 2 sessões</b> para rodar o "
+            "teste; <b>≥ 5</b> para um resultado confiável. O programa escolhe o "
+            "teste, monta a tabela por banda (δ θ α β γ) e explica em linguagem "
+            "simples. Aceita <b>.csv</b> e também <b>.edf/.bdf</b> (converte na hora).")
+        intro.setWordWrap(True); intro.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        v.addWidget(intro)
+        for key, default in (("A", "Antes"), ("B", "Depois")):
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(QtWidgets.QLabel(f"Grupo {key}:"))
+            name = QtWidgets.QLineEdit(default); setattr(self, f"name_{key}", name)
+            row.addWidget(name)
+            cnt = QtWidgets.QLabel("0 sessões"); setattr(self, f"cnt_{key}", cnt)
+            row.addWidget(cnt, 1)
+            btn = QtWidgets.QPushButton("Selecionar sessões…")
+            btn.clicked.connect(lambda _, k=key: self._pick(k))
+            row.addWidget(btn)
+            v.addLayout(row)
+        self.paired_chk = QtWidgets.QCheckBox(
+            "Amostras pareadas (os mesmos sujeitos nos dois grupos)")
+        v.addWidget(self.paired_chk)
+        run = QtWidgets.QPushButton("Comparar")
+        run.clicked.connect(self._compute)
+        v.addWidget(run)
+        self.table = QtWidgets.QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(
+            ["Banda", "Grupo A", "Grupo B", "Teste", "p", "p (Holm)",
+             "Efeito", "Signif.?"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        v.addWidget(self.table, 1)
+        self.summary = QtWidgets.QTextEdit(); self.summary.setReadOnly(True)
+        self.summary.setMaximumHeight(140)
+        v.addWidget(self.summary)
+        save = QtWidgets.QPushButton("Salvar relatório (HTML + CSV)…")
+        save.clicked.connect(self._save)
+        v.addWidget(save)
+
+    def _pick(self, key):
+        start = getattr(self.main.config, "save_directory", "")
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, f"Sessões do Grupo {key}", start,
+            "Sessões (*.csv *.edf *.bdf *.EDF *.BDF);;CSV (*.csv);;Todos (*)")
+        if not files:
+            return
+        # Converte EDF/BDF -> CSV nativo (temporário) automaticamente.
+        resolved = []
+        for f in files:
+            if os.path.splitext(f)[1].lower() in (".edf", ".bdf"):
+                try:
+                    import tempfile
+                    tmp = os.path.join(
+                        tempfile.gettempdir(),
+                        f"edfimp_{os.path.splitext(os.path.basename(f))[0][:30]}.csv")
+                    edf_to_native_csv(f, tmp)
+                    resolved.append(tmp)
+                except Exception as exc:
+                    QtWidgets.QMessageBox.warning(
+                        self, "EDF", f"Não consegui ler {os.path.basename(f)}:\n{exc}")
+            else:
+                resolved.append(f)
+        self._files[key] = resolved
+        lbl = getattr(self, f"cnt_{key}")
+        n = len(resolved)
+        if n >= 5:
+            lbl.setText(f"{n} sessões ✓ (bom)"); lbl.setStyleSheet("color:#1E7E34;")
+        elif n >= 2:
+            lbl.setText(f"{n} sessões ✓ (mínimo; ≥5 é melhor)")
+            lbl.setStyleSheet("color:#B8860B;")
+        else:
+            lbl.setText(f"{n} sessão — precisa de ≥ 2")
+            lbl.setStyleSheet("color:#C0392B;")
+
+    def _band_powers(self, csv_path):
+        d = self.main._load_session_csv(csv_path)
+        if not d:
+            return None
+        eeg, sr = d["eeg"], d["sr"]
+        out = {}
+        for band, (lo, hi) in EEG_BANDS.items():
+            vals = []
+            for i in range(eeg.shape[0]):
+                f, psd = scipy_signal.welch(eeg[i], fs=sr,
+                                            nperseg=min(256, eeg.shape[1]))
+                m = (f >= lo) & (f < hi)
+                vals.append(float(_TRAPEZOID(psd[m], f[m])) if np.any(m) else 0.0)
+            out[band] = float(np.mean(vals)) if vals else 0.0
+        return out
+
+    def _compute(self):
+        A, B = self._files["A"], self._files["B"]
+        if not A or not B:
+            QtWidgets.QMessageBox.warning(
+                self, "Grupos", "Selecione sessões nos dois grupos.")
+            return None
+        nameA = self.name_A.text().strip() or "A"
+        nameB = self.name_B.text().strip() or "B"
+        powA = [p for p in (self._band_powers(c) for c in A) if p]
+        powB = [p for p in (self._band_powers(c) for c in B) if p]
+        if not powA or not powB:
+            QtWidgets.QMessageBox.critical(
+                self, "Dados", "Não consegui ler potências de banda das sessões.")
+            return None
+        # Checagem de amostra ACIONÁVEL (o beta tester travava aqui sem entender).
+        if len(powA) < 2 or len(powB) < 2:
+            QtWidgets.QMessageBox.warning(
+                self, "Amostra insuficiente",
+                f"Para comparar, cada grupo precisa de pelo menos 2 sessões — "
+                f"cada sessão conta como 1 amostra, e não dá para estimar a "
+                f"variação com uma só.\n\n"
+                f"Você tem agora:   {nameA} = {len(powA)}   |   {nameB} = {len(powB)}\n\n"
+                f"Dica: você pode juntar sessões de VÁRIOS pacientes no mesmo grupo "
+                f"(o \"antes\" de todos num grupo, o \"depois\" de todos no outro).\n"
+                f"Recomendado: 5 ou mais por grupo para um resultado confiável.")
+            return None
+        bands = list(EEG_BANDS.keys())
+        results, pvals = [], []
+        for band in bands:
+            ga = [p[band] for p in powA]; gb = [p[band] for p in powB]
+            r = auto_compare([ga, gb], [nameA, nameB],
+                             paired=self.paired_chk.isChecked())
+            results.append((band, r)); pvals.append(r["p"])
+        adj = holm_correction(pvals)
+        self._rows = []
+        self.table.setRowCount(len(results))
+        for i, (band, r) in enumerate(results):
+            da, db = r["descr"]
+            eff = r.get("effect")
+            eff_txt = (f"{r['effect_name']}={eff:.2f}"
+                       if (eff is not None and np.isfinite(eff)
+                           and r["effect_name"] not in ("—", None)) else "—")
+            cells = {
+                "banda": band,
+                "A": f"{da['mean']:.3g}±{da['sd']:.2g} (n={da['n']})",
+                "B": f"{db['mean']:.3g}±{db['sd']:.2g} (n={db['n']})",
+                "teste": r["test"],
+                "p": f"{r['p']:.4f}" if np.isfinite(r["p"]) else "—",
+                "p_holm": f"{adj[i]:.4f}" if np.isfinite(adj[i]) else "—",
+                "efeito": eff_txt,
+                "signif": "SIM" if (np.isfinite(adj[i]) and adj[i] < 0.05) else "não",
+            }
+            for j, key in enumerate(self.COLS):
+                self.table.setItem(i, j, QtWidgets.QTableWidgetItem(str(cells[key])))
+            self._rows.append(cells)
+        self.table.setHorizontalHeaderLabels(
+            ["Banda", nameA, nameB, "Teste", "p", "p (Holm)", "Efeito", "Signif.?"])
+        self.table.resizeColumnsToContents()
+        sig = [band for (band, _r), a in zip(results, adj)
+               if np.isfinite(a) and a < 0.05]
+        lines = [f"Comparação: {nameA} ({len(powA)} sessões) × "
+                 f"{nameB} ({len(powB)} sessões), por banda de potência média."]
+        if sig:
+            lines.append("Bandas com diferença significativa (após correção de "
+                         "múltiplas comparações, Holm): " + ", ".join(sig) + ".")
+        else:
+            lines.append("Nenhuma banda apresentou diferença significativa após a "
+                         "correção de múltiplas comparações.")
+        for band, r in results:
+            lines.append(f"• {band}: {interpret_result(r)}")
+        self.summary.setPlainText("\n".join(lines))
+        return self._rows
+
+    def _save(self):
+        if not self._rows:
+            QtWidgets.QMessageBox.information(
+                self, "Nada a salvar", "Rode a comparação primeiro.")
+            return
+        start = getattr(self.main.config, "save_directory", "")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Salvar relatório",
+            os.path.join(start, "estatistica_guiada.html"), "HTML (*.html)")
+        if not path:
+            return
+        self._write_report(path)
+        QtWidgets.QMessageBox.information(self, "Salvo", f"Relatório salvo:\n{path}")
+
+    def _write_report(self, path):
+        import csv as _csv
+        csv_path = os.path.splitext(path)[0] + ".csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = _csv.writer(f); w.writerow(self.COLS)
+            for r in self._rows:
+                w.writerow([r[k] for k in self.COLS])
+        nameA = self.name_A.text().strip() or "A"
+        nameB = self.name_B.text().strip() or "B"
+        rows_html = "".join(
+            "<tr>" + "".join(f"<td>{r[k]}</td>" for k in self.COLS) + "</tr>"
+            for r in self._rows)
+        summ = self.summary.toPlainText().replace("&", "&amp;").replace(
+            "<", "&lt;").replace("\n", "<br>")
+        html = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            f"<title>Estatística guiada — {APP_NAME}</title><style>"
+            "body{font-family:Arial,sans-serif;margin:24px;color:#1a2230}"
+            "table{border-collapse:collapse;width:100%;font-size:14px}"
+            "th,td{border:1px solid #dbe1ea;padding:6px 10px;text-align:left}"
+            "th{background:#eef4f1;color:#0c7f5f}h1{color:#0f9d75;font-size:20px}"
+            "</style></head><body><h1>Relatório de Estatística Guiada</h1>"
+            f"<p>{APP_NAME} v{APP_VERSION} — {APP_AUTHORS}</p>"
+            "<table><thead><tr>"
+            f"<th>Banda</th><th>{nameA}</th><th>{nameB}</th><th>Teste</th>"
+            "<th>p</th><th>p (Holm)</th><th>Efeito</th><th>Signif.?</th>"
+            f"</tr></thead><tbody>{rows_html}</tbody></table>"
+            f"<h3>Conclusão</h3><p>{summ}</p>"
+            f"<p style='color:#5b6473;font-size:12px'>Gerado por {APP_NAME} "
+            f"v{APP_VERSION} — {CODE_URL}</p></body></html>")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        return csv_path
+
+
+# ============================================================
+# IntraSessionStatsDialog — comparar CONDIÇÕES dentro de uma sessão (genérico)
+# ============================================================
+class IntraSessionStatsDialog(QtWidgets.QDialog):
+    """Facilitador GENÉRICO e MULTIMODAL: compara as condições/classes presentes
+    em UMA sessão — sejam quais forem (dorsi/plantar, mãos, ou o que o usuário
+    marcar) — por uma métrica que o próprio usuário escolhe (potência de banda
+    para EEG, RMS para EMG/ECG, ou ERD% vs repouso). Não assume nenhum movimento."""
+
+    METRICS = [("band", "Potência de banda (EEG)"),
+               ("rms", "RMS / amplitude (qualquer sinal)"),
+               ("erd", "ERD% vs repouso (EEG)")]
+
+    def __init__(self, main, session=None):
+        super().__init__(main)
+        self.main = main
+        self.d = None
+        self._last = None
+        self.setWindowTitle("Comparar condições da sessão (genérico/multimodal)")
+        self.resize(840, 580)
+        v = QtWidgets.QVBoxLayout(self)
+        intro = QtWidgets.QLabel(
+            "Compara as <b>condições/classes marcadas nesta sessão</b> — sejam "
+            "quais forem — pela métrica que você escolher. Genérico e multimodal: "
+            "ajuste métrica/banda/canais ao seu caso (EEG, EMG, ECG, EoG). O teste "
+            "estatístico é escolhido automaticamente.")
+        intro.setWordWrap(True); intro.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        v.addWidget(intro)
+        row0 = QtWidgets.QHBoxLayout()
+        self.sess_lbl = QtWidgets.QLabel("(nenhuma sessão carregada)")
+        load_btn = QtWidgets.QPushButton("Carregar sessão…")
+        load_btn.clicked.connect(self._load)
+        row0.addWidget(self.sess_lbl, 1); row0.addWidget(load_btn)
+        v.addLayout(row0)
+        rowm = QtWidgets.QHBoxLayout()
+        rowm.addWidget(QtWidgets.QLabel("Métrica:"))
+        self.metric_combo = QtWidgets.QComboBox()
+        for key, lbl in self.METRICS:
+            self.metric_combo.addItem(lbl, key)
+        rowm.addWidget(self.metric_combo)
+        rowm.addWidget(QtWidgets.QLabel("Banda:"))
+        self.band_combo = QtWidgets.QComboBox()
+        for b in EEG_BANDS:
+            self.band_combo.addItem(b)
+        rowm.addWidget(self.band_combo)
+        rowm.addWidget(QtWidgets.QLabel("Canais:"))
+        self.chan_combo = QtWidgets.QComboBox()
+        self.chan_combo.addItem("Todos (média)")
+        rowm.addWidget(self.chan_combo, 1)
+        v.addLayout(rowm)
+        run = QtWidgets.QPushButton("Comparar")
+        run.clicked.connect(self._compute)
+        v.addWidget(run)
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["Condição", "n", "Média ± DP", "Mediana"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        v.addWidget(self.table, 1)
+        self.summary = QtWidgets.QTextEdit(); self.summary.setReadOnly(True)
+        self.summary.setMaximumHeight(150)
+        v.addWidget(self.summary)
+        save = QtWidgets.QPushButton("Salvar relatório (HTML + CSV)…")
+        save.clicked.connect(self._save)
+        v.addWidget(save)
+        if session:
+            self.set_session(session)
+
+    def set_session(self, d):
+        self.d = d
+        self.chan_combo.clear(); self.chan_combo.addItem("Todos (média)")
+        for nm in d.get("ch_names", []):
+            self.chan_combo.addItem(nm)
+        dur = d["eeg"].shape[1] / d["sr"] if d.get("sr") else 0
+        self.sess_lbl.setText(
+            f"{d['eeg'].shape[0]} canais · {dur:.0f}s · "
+            f"{len(d.get('trials', []))} eventos · "
+            f"{len(d.get('markers', []))} marcadores")
+
+    def _load(self):
+        start = getattr(self.main.config, "save_directory", "")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Abrir sessão (data.csv)", start, "CSV (*.csv)")
+        if not path:
+            return
+        d = self.main._load_session_csv(path)
+        if d:
+            self.set_session(d)
+
+    def _chan_idx(self):
+        i = self.chan_combo.currentIndex()
+        n = self.d["eeg"].shape[0]
+        if i <= 0:
+            return list(range(n))
+        return [min(i - 1, n - 1)]
+
+    def _bandpower(self, seg, sr, lo, hi):
+        vals = []
+        for i in range(seg.shape[0]):
+            f, psd = scipy_signal.welch(seg[i], fs=sr, nperseg=min(256, seg.shape[1]))
+            m = (f >= lo) & (f < hi)
+            vals.append(float(_TRAPEZOID(psd[m], f[m])) if np.any(m) else 0.0)
+        return float(np.mean(vals)) if vals else 0.0
+
+    def _conditions(self):
+        """Genérico: {rótulo: [valor por trial/segmento]} + fonte. Usa trials
+        (Event Id/Class Id) se houver; senão segmenta por marcadores."""
+        d = self.d; eeg = d["eeg"]; sr = d["sr"]; N = eeg.shape[1]
+        chans = self._chan_idx()
+        metric = self.metric_combo.currentData()
+        band = self.band_combo.currentText(); lo, hi = EEG_BANDS[band]
+        base_phases = getattr(self.main, "BASELINE_PHASES",
+                              ("baseline", "pre_rest", "inter_baseline"))
+
+        def seg_of(s0, s1):
+            s0 = max(0, int(s0)); s1 = min(N, int(s1))
+            return eeg[np.ix_(chans, range(s0, s1))] if s1 - s0 >= 16 else None
+
+        def value(seg, base_seg=None):
+            if metric == "rms":
+                return float(np.mean([np.sqrt(np.mean(seg[i] ** 2))
+                                      for i in range(seg.shape[0])]))
+            bp = self._bandpower(seg, sr, lo, hi)
+            if metric == "erd":
+                if base_seg is None:
+                    return float("nan")
+                bb = self._bandpower(base_seg, sr, lo, hi)
+                return (bp - bb) / bb * 100.0 if bb > 0 else float("nan")
+            return bp
+
+        out = {}
+        trials = [t for t in d.get("trials", []) if t.get("phase") == "mi"]
+        if trials:
+            base_trials = [t for t in d.get("trials", [])
+                           if t.get("phase") in base_phases]
+            for t in trials:
+                seg = seg_of(t.get("start_line", 1) - 2, t.get("end_line", 1) - 1)
+                if seg is None:
+                    continue
+                bseg = None
+                if metric == "erd" and base_trials:
+                    prev = [b for b in base_trials
+                            if b.get("start_line", 0) <= t.get("start_line", 0)]
+                    bt = prev[-1] if prev else base_trials[0]
+                    bseg = seg_of(bt.get("start_line", 1) - 2,
+                                  bt.get("end_line", 1) - 1)
+                val = value(seg, bseg)
+                if val is not None and np.isfinite(val):
+                    cid = t.get("class_id", -1)
+                    label = (t.get("class_name")
+                             or (f"classe {cid}" if cid >= 0 else "MI"))
+                    out.setdefault(str(label), []).append(val)
+            # Adiciona REPOUSO como condição (permite comparar mesmo com 1 só
+            # classe: "houve efeito vs repouso?"). ERD já é relativo à baseline,
+            # então não entra como grupo.
+            if metric != "erd":
+                for b in base_trials:
+                    seg = seg_of(b.get("start_line", 1) - 2, b.get("end_line", 1) - 1)
+                    if seg is None:
+                        continue
+                    val = value(seg, None)
+                    if val is not None and np.isfinite(val):
+                        out.setdefault("Repouso", []).append(val)
+            return out, "classes + repouso (Event Id)"
+        # Fallback genérico: condições por marcadores (formato nativo)
+        markers = d.get("markers", [])
+        if markers:
+            for i, (ts, lab) in enumerate(markers):
+                t_next = markers[i + 1][0] if i + 1 < len(markers) else ts + 5.0
+                seg = seg_of(ts * sr, min(t_next, ts + 5.0) * sr)
+                if seg is None:
+                    continue
+                val = value(seg, seg if metric == "erd" else None)
+                if val is not None and np.isfinite(val):
+                    out.setdefault(str(lab), []).append(val)
+            return out, "marcadores"
+        return {}, "—"
+
+    def _compute(self):
+        if not self.d:
+            QtWidgets.QMessageBox.warning(self, "Sessão",
+                                         "Carregue uma sessão primeiro.")
+            return None
+        groups, source = self._conditions()
+        groups = {k: vv for k, vv in groups.items() if len(vv) >= 1}
+        if len(groups) < 2:
+            QtWidgets.QMessageBox.information(
+                self, "Condições insuficientes",
+                "Não encontrei pelo menos 2 condições/classes nesta sessão. Use "
+                "uma sessão com eventos/marcadores (ou compare grupos de sessões "
+                "em 'Estatística guiada').")
+            return None
+        names = list(groups.keys()); vals = [groups[k] for k in names]
+        r = auto_compare(vals, names)
+        self.table.setRowCount(len(names))
+        rows = []
+        for i, nm in enumerate(names):
+            dsc = r["descr"][i]
+            cells = [nm, str(dsc["n"]),
+                     f"{dsc['mean']:.3g} ± {dsc['sd']:.2g}",
+                     f"{dsc['median']:.3g}"]
+            for j, c in enumerate(cells):
+                self.table.setItem(i, j, QtWidgets.QTableWidgetItem(c))
+            rows.append(cells)
+        self.table.resizeColumnsToContents()
+        metric_lbl = dict(self.METRICS)[self.metric_combo.currentData()]
+        band_txt = (f" ({self.band_combo.currentText()})"
+                    if self.metric_combo.currentData() != "rms" else "")
+        head = (f"Métrica: {metric_lbl}{band_txt}  |  Canais: "
+                f"{self.chan_combo.currentText()}  |  Condições de: {source}")
+        concl = interpret_result(r)
+        self.summary.setPlainText(head + "\n\n" + concl)
+        self._last = {"rows": rows, "head": head, "concl": concl}
+        return self._last
+
+    def _save(self):
+        if not self._last:
+            QtWidgets.QMessageBox.information(self, "Nada a salvar",
+                                             "Rode a comparação primeiro.")
+            return
+        start = getattr(self.main.config, "save_directory", "")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Salvar relatório",
+            os.path.join(start, "comparacao_condicoes.html"), "HTML (*.html)")
+        if not path:
+            return
+        import csv as _csv
+        csv_path = os.path.splitext(path)[0] + ".csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = _csv.writer(f); w.writerow(["condicao", "n", "media_dp", "mediana"])
+            for r in self._last["rows"]:
+                w.writerow(r)
+        rows_html = "".join(
+            "<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>"
+            for r in self._last["rows"])
+        summ = (self._last["head"] + "\n\n" + self._last["concl"]).replace(
+            "&", "&amp;").replace("<", "&lt;").replace("\n", "<br>")
+        html = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            f"<title>Comparação de condições — {APP_NAME}</title><style>"
+            "body{font-family:Arial,sans-serif;margin:24px;color:#1a2230}"
+            "table{border-collapse:collapse;width:100%;font-size:14px}"
+            "th,td{border:1px solid #dbe1ea;padding:6px 10px;text-align:left}"
+            "th{background:#eef4f1;color:#0c7f5f}h1{color:#0f9d75;font-size:20px}"
+            "</style></head><body><h1>Comparação de condições da sessão</h1>"
+            f"<p>{APP_NAME} v{APP_VERSION} — {APP_AUTHORS}</p>"
+            "<table><thead><tr><th>Condição</th><th>n</th><th>Média ± DP</th>"
+            f"<th>Mediana</th></tr></thead><tbody>{rows_html}</tbody></table>"
+            f"<h3>Conclusão</h3><p>{summ}</p>"
+            f"<p style='color:#5b6473;font-size:12px'>Gerado por {APP_NAME} "
+            f"v{APP_VERSION} — {CODE_URL}</p></body></html>")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        QtWidgets.QMessageBox.information(self, "Salvo", f"Relatório salvo:\n{path}")
+
+
+# ============================================================
 # SerialReaderThread — Hardware/Simulação/Playback com suporte a expansão 16ch
 # ============================================================
 class SerialReaderThread(QThread):
-    data_received    = pyqtSignal(np.ndarray, np.ndarray)
-    error            = pyqtSignal(str)
-    connection_state = pyqtSignal(bool)
-    progress         = pyqtSignal(float)
-    expansion_detected = pyqtSignal(int)  # emite num de canais detectados (8 ou 16)
+    data_received    = Signal(np.ndarray, np.ndarray)
+    error            = Signal(str)
+    connection_state = Signal(bool)
+    progress         = Signal(float)
+    expansion_detected = Signal(int)  # emite num de canais detectados (8 ou 16)
 
     SCALE_UV    = 4.5 / 24.0 / (2 ** 23 - 1) * 1_000_000.0
     SCALE_ACCEL = 0.002
@@ -1825,7 +2524,22 @@ class SerialReaderThread(QThread):
             self.error.emit(f"CSV de playback não encontrado: {self.playback_path}")
             return
         try:
-            data = np.loadtxt(self.playback_path, delimiter=",", skiprows=1)
+            # Le o cabecalho para NAO tentar converter a coluna textual 'marker'
+            # (data.csv nativo sempre termina em 'marker' -> np.loadtxt falharia
+            #  ate quando os marcadores estao vazios). Espelha _load_native_session_csv.
+            usecols = None
+            try:
+                with open(self.playback_path, "r", encoding="utf-8", errors="ignore") as _f:
+                    header = next(csv.reader(_f))
+                num_cols = [i for i, h in enumerate(header)
+                            if h.strip().endswith("_uV")
+                            or h.strip() in ("timestamp_s", "ax_g", "ay_g", "az_g")]
+                if num_cols:
+                    usecols = num_cols
+            except Exception:
+                usecols = None
+            data = np.loadtxt(self.playback_path, delimiter=",", skiprows=1,
+                              usecols=usecols, encoding="utf-8")
         except Exception as exc:
             self.error.emit(f"Falha lendo CSV: {exc}")
             return
@@ -1968,6 +2682,189 @@ class SerialReaderThread(QThread):
 
 
 # ============================================================
+# Leitor EDF/BDF TOLERANTE (numpy puro) — lê exames clínicos mesmo com
+# cabeçalho quebrado (ex.: iCelera com acento no nome do paciente, que faz
+# EDFbrowser/pyedflib recusarem o arquivo inteiro). Só lê os campos NUMÉRICOS
+# do header; ignora textos não-ASCII. Não depende de pyedflib (funciona no .exe).
+# Especificação EDF: https://www.edfplus.info/specs/edf.html
+# ============================================================
+def read_edf(path):
+    """Lê um EDF/BDF de forma tolerante. Retorna dict com labels, signals
+    (µV físicos), fs por canal, etc. Ignora o campo de texto do paciente."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    if len(raw) < 256:
+        raise ValueError("Arquivo muito curto para ser EDF/BDF.")
+    H = raw[:256]
+
+    def _num(b, default="0"):
+        s = b.decode("ascii", "ignore").strip()
+        return s or default
+
+    try:
+        ns = int(_num(H[252:256]))
+    except ValueError:
+        raise ValueError("Cabeçalho EDF inválido (nº de sinais).")
+    if ns <= 0 or ns > 2048:
+        raise ValueError(f"Nº de sinais fora do esperado: {ns}")
+    n_records = int(_num(H[236:244], "-1"))
+    rec_dur = float(_num(H[244:252], "1")) or 1.0
+    reserved = H[192:236].decode("ascii", "replace").upper()
+    is_bdf = (raw[:1] == b"\xff") or ("BDF" in reserved) or path.lower().endswith(".bdf")
+
+    p = [256]
+    def field(size):
+        chunk = raw[p[0]:p[0] + size * ns]; p[0] += size * ns
+        return [chunk[i * size:(i + 1) * size] for i in range(ns)]
+
+    labels   = [x.decode("ascii", "replace").strip() for x in field(16)]
+    field(80)                                       # transducer
+    phys_dim = [x.decode("ascii", "replace").strip() for x in field(8)]
+    phys_min = [float(_num(x)) for x in field(8)]
+    phys_max = [float(_num(x)) for x in field(8)]
+    dig_min  = [float(_num(x)) for x in field(8)]
+    dig_max  = [float(_num(x)) for x in field(8)]
+    field(80)                                       # prefiltering
+    nsamp    = [int(_num(x)) for x in field(8)]     # amostras por registro
+    field(32)                                       # reserved por sinal
+
+    bps = 3 if is_bdf else 2
+    data_start = 256 + ns * 256
+    rec_size = int(np.sum(nsamp)) * bps
+    if n_records < 0 and rec_size:
+        n_records = max(0, (len(raw) - data_start) // rec_size)
+    sig_off = (np.concatenate([[0], np.cumsum(nsamp)]) * bps).astype(np.int64)
+    sigs = [np.empty(nsamp[s] * n_records, dtype=np.float64) for s in range(ns)]
+    for r in range(n_records):
+        base = data_start + r * rec_size
+        for s in range(ns):
+            cnt = nsamp[s]
+            if cnt == 0:
+                continue
+            st = base + int(sig_off[s])
+            b = raw[st:st + cnt * bps]
+            if len(b) < cnt * bps:
+                cnt = len(b) // bps
+                b = b[:cnt * bps]
+            if is_bdf:
+                a = np.frombuffer(b, np.uint8).reshape(-1, 3).astype(np.int32)
+                v = a[:, 0] | (a[:, 1] << 8) | (a[:, 2] << 16)
+                v = np.where(v >= (1 << 23), v - (1 << 24), v).astype(np.float64)
+            else:
+                v = np.frombuffer(b, "<i2").astype(np.float64)
+            sigs[s][r * nsamp[s]: r * nsamp[s] + cnt] = v
+    for s in range(ns):
+        dmn, dmx, pmn, pmx = dig_min[s], dig_max[s], phys_min[s], phys_max[s]
+        if dmx != dmn:
+            sigs[s] = pmn + (sigs[s] - dmn) * (pmx - pmn) / (dmx - dmn)
+    fs = [nsamp[s] / rec_dur if rec_dur else 0.0 for s in range(ns)]
+    return {"labels": labels, "signals": sigs, "fs": fs, "phys_dim": phys_dim,
+            "n_records": n_records, "rec_dur": rec_dur, "is_bdf": is_bdf}
+
+
+def edf_to_native_csv(edf_path, out_csv, max_seconds=None):
+    """Converte um EDF/BDF para o CSV NATIVO do OpenBiônica (time_s,<ch>_uV,...)
+    para abrir direto no modo Offline. Descarta canais de anotação e usa a taxa
+    de amostragem dominante (canais EEG). Retorna (out_csv, labels, fs, n)."""
+    r = read_edf(edf_path)
+    idxs = [i for i, l in enumerate(r["labels"])
+            if "annotation" not in l.lower() and r["fs"][i] > 0 and len(r["signals"][i])]
+    if not idxs:
+        raise ValueError("Nenhum canal de sinal válido encontrado no EDF.")
+    # taxa de amostragem dominante (moda dos fs arredondados)
+    fs_round = [int(round(r["fs"][i])) for i in idxs]
+    fs = max(set(fs_round), key=fs_round.count)
+    keep = [i for i in idxs if int(round(r["fs"][i])) == fs]
+    labels = [r["labels"][i] or f"CH{k+1}" for k, i in enumerate(keep)]
+    n = min(len(r["signals"][i]) for i in keep)
+    if max_seconds:
+        n = min(n, int(max_seconds * fs))
+    t = (np.arange(n) / float(fs)).reshape(-1, 1)
+    mat = np.column_stack([r["signals"][i][:n] for i in keep])
+    data = np.column_stack([t, mat])
+    header = "time_s," + ",".join(f"{l}_uV" for l in labels)
+    # tempo com precisão fixa (senão a SR medida sai errada em exames longos);
+    # sinais em 6 algarismos significativos (mais que suficiente p/ µV).
+    fmt = ["%.6f"] + ["%.6g"] * len(labels)
+    np.savetxt(out_csv, data, delimiter=",", header=header, comments="", fmt=fmt)
+    return out_csv, labels, fs, n
+
+
+# ============================================================
+# ICA (FastICA) em numpy PURO — remove artefato ocular (piscada) sem depender
+# do MNE nem de pip install. Funciona no .exe. Algoritmo FastICA simétrico
+# (Hyvärinen 1999) com não-linearidade tanh.
+# ============================================================
+def _fast_ica_W(Xw, n_components, max_iter=250, tol=1e-5, seed=42):
+    """FastICA simétrico sobre dados JÁ branqueados Xw (n_comp x n)."""
+    n = Xw.shape[1]
+    rng = np.random.RandomState(seed)
+    def _sym(W):
+        u, _s, vt = np.linalg.svd(W, full_matrices=False)
+        return u @ vt
+    W = _sym(rng.randn(n_components, n_components))
+    for _ in range(max_iter):
+        WX = W @ Xw
+        g = np.tanh(WX)
+        gp = (1.0 - g * g).mean(axis=1)
+        Wn = _sym((g @ Xw.T) / n - gp[:, None] * W)
+        lim = np.max(np.abs(np.abs(np.sum(Wn * W, axis=1)) - 1.0))
+        W = Wn
+        if lim < tol:
+            break
+    return W
+
+
+def ica_clean_eog(eeg_uV, sr, ch_names, n_components=None):
+    """Remove piscadas por ICA (numpy puro). Filtra 1-40 Hz (estabiliza a ICA),
+    detecta o componente ocular (correlação com canais frontais ou curtose) e
+    reconstrói. Retorna (eeg_limpo_uV, indices_excluidos, info)."""
+    X = np.asarray(eeg_uV, dtype=float)
+    n_ch, n = X.shape
+    if n_ch < 2 or n < 32:
+        return X, [], {"backend": "numpy", "note": "sinal curto demais"}
+    try:
+        hi = min(40.0, sr / 2.0 * 0.98)
+        sos = scipy_signal.butter(4, [1.0, hi], btype="band", fs=sr, output="sos")
+        Xf = scipy_signal.sosfiltfilt(sos, X, axis=1)
+    except Exception:
+        Xf = X - X.mean(axis=1, keepdims=True)
+    mean = Xf.mean(axis=1, keepdims=True)
+    Xc = Xf - mean
+    cov = np.cov(Xc)
+    dvals, E = np.linalg.eigh(cov)
+    order = np.argsort(dvals)[::-1]
+    k = min(n_components or 15, n_ch)
+    sel = order[:k]
+    dsel = np.maximum(dvals[sel], 1e-12)
+    K = (E[:, sel] / np.sqrt(dsel)).T          # branqueamento  k x n_ch
+    Xw = K @ Xc
+    W = _fast_ica_W(Xw, k)
+    S = W @ Xw                                  # fontes  k x n
+    frontal = [i for i, nm in enumerate(ch_names)
+               if nm.upper().replace("EEG", "").replace("-", "").strip()
+               in ("FP1", "FP2", "FPZ", "AF7", "AF8", "FP1F", "FP2F")]
+    excluded = []
+    if frontal:
+        fsig = Xc[frontal].mean(axis=0)
+        cors = np.array([abs(np.corrcoef(S[c], fsig)[0, 1]) for c in range(k)])
+        cmax = int(np.nanargmax(cors))
+        if np.isfinite(cors[cmax]) and cors[cmax] > 0.5:
+            excluded = [cmax]
+    if not excluded:                            # fallback: fonte mais impulsiva
+        kurt = np.array([float(((S[c] - S[c].mean()) ** 4).mean()
+                               / (S[c].var() ** 2 + 1e-12) - 3.0) for c in range(k)])
+        cmax = int(np.argmax(kurt))
+        if kurt[cmax] > 10:
+            excluded = [cmax]
+    S2 = S.copy()
+    for c in excluded:
+        S2[c] = 0.0
+    clean = (np.linalg.pinv(K) @ (np.linalg.pinv(W) @ S2)) + mean
+    return clean, excluded, {"backend": "numpy", "n_components": k}
+
+
+# ============================================================
 # SignalProcessor
 # ============================================================
 class SignalProcessor:
@@ -1977,7 +2874,10 @@ class SignalProcessor:
         if n < 2:
             return np.array([]), np.array([])
         window = np.hanning(n)
-        spectrum = np.abs(rfft(data * window)) * 2.0 / n
+        # 2/sum(window) compensa o ganho coerente da janela (Hanning ~0.5);
+        # com janela retangular sum=n, generaliza. Antes usava 2/n -> ~2x baixo.
+        wsum = float(np.sum(window)) or float(n)
+        spectrum = np.abs(rfft(data * window)) * 2.0 / wsum
         freqs = rfftfreq(n, 1.0 / sample_rate)
         return freqs, spectrum
 
@@ -2155,6 +3055,7 @@ class HeadPlotWidget(QtWidgets.QWidget):
         self.band_name = "Alpha"
         self.show_heatmap = True
         self.show_dots = True
+        self.map_mode = "interp"   # "interp" (potencial) | "csd" (Laplaciano)
         # Mapeamento default; sera atualizado por set_mapping()
         self.mapping = list(DEFAULT_MAPPING)
         self.setMinimumSize(420, 420)
@@ -2179,10 +3080,37 @@ class HeadPlotWidget(QtWidgets.QWidget):
     def set_powers(self, values, band_name="Alpha"):
         self.raw_values = [float(v) for v in values]
         self.band_name = band_name
-        active = self.raw_values[: self.num_channels]
-        vmax = max(active) if any(v > 0 for v in active) else 1.0
-        self.powers = [min(1.0, max(0.0, v / vmax)) for v in self.raw_values]
+        self._recompute_display()
         self.update()
+
+    def set_map_mode(self, mode):
+        """Modo do mapa: 'interp' (potencial de escalpo, IDW) ou 'csd'
+        (Laplaciano de superfície — realça fontes locais, reduz condução de
+        volume [McFarland 1997; Nunez & Srinivasan 2006])."""
+        self.map_mode = "csd" if str(mode).lower().startswith("csd") else "interp"
+        self._recompute_display()
+        self.update()
+
+    def _recompute_display(self):
+        """Recalcula os valores 0..1 exibidos, conforme o modo (interp/CSD)."""
+        n = max(0, int(self.num_channels))
+        raw = np.array(self.raw_values[:n], dtype=float) if n else np.array([])
+        if self.map_mode == "csd" and n >= 4:
+            pos = np.array([ALL_ELECTRODES.get(
+                self.mapping[i] if i < len(self.mapping) else None, (0.0, 0.0))
+                for i in range(n)], dtype=float)
+            csd = raw.copy()
+            k = min(4, n - 1)
+            for i in range(n):
+                d2 = np.sum((pos - pos[i]) ** 2, axis=1); d2[i] = np.inf
+                nn = np.argsort(d2)[:k]
+                csd[i] = raw[i] - float(np.mean(raw[nn]))
+            vals = np.abs(csd)                       # magnitude da fonte local
+        else:
+            vals = np.clip(raw, 0.0, None)
+        vmax = float(np.max(vals)) if vals.size and np.max(vals) > 0 else 1.0
+        disp = list(np.clip(vals / vmax, 0.0, 1.0)) if vals.size else []
+        self.powers = disp + [0.0] * (MAX_CHANNELS - len(disp))
 
     # ----- interpolacao IDW (vetorizada) ---------------------------
     def _compute_heatmap_image(self, r_px):
@@ -2269,8 +3197,9 @@ class HeadPlotWidget(QtWidgets.QWidget):
         p.setPen(QtGui.QPen(QtGui.QColor(COLORS["accent"])))
         title_font = QtGui.QFont(FONT_UI, 11, QtGui.QFont.Weight.Bold)
         p.setFont(title_font)
+        mode_txt = "CSD/LAPLACIANO" if self.map_mode == "csd" else "POTÊNCIA"
         p.drawText(QtCore.QRectF(0, 4, w, 18), QtCore.Qt.AlignmentFlag.AlignCenter,
-                   f"BANDA: {self.band_name.upper()}  ({self.num_channels}ch)")
+                   f"{mode_txt} · {self.band_name.upper()}  ({self.num_channels}ch)")
 
         # ----- Eletrodos (dots) -----
         if self.show_dots:
@@ -2723,9 +3652,9 @@ class _BluetoothScanThread(QtCore.QThread):
         scan_done(list of dicts {name, address, rssi, type})
         scan_failed(str error_message)
     """
-    scan_progress = QtCore.pyqtSignal(int)
-    scan_done = QtCore.pyqtSignal(list)
-    scan_failed = QtCore.pyqtSignal(str)
+    scan_progress = QtCore.Signal(int)
+    scan_done = QtCore.Signal(list)
+    scan_failed = QtCore.Signal(str)
 
     def __init__(self, duration_s=8.0, parent=None):
         super().__init__(parent)
@@ -2805,14 +3734,16 @@ class _WorkflowCard(QtWidgets.QFrame):
     Recebe as cores via parâmetro (tema). Hover é controlado por property
     [hover="true"] aplicada via QSS no nível do diálogo.
     """
-    clicked = QtCore.pyqtSignal()
+    clicked = QtCore.Signal()
 
     def __init__(self, title, subtitle, icon_text, accent_color,
                  text_color="#1a1a1a", dim_color="#666666", parent=None):
         super().__init__(parent)
         self.setObjectName("workflowCard")
         self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.setMinimumSize(220, 170)
+        # Largura mínima enxuta para que 2 cards caibam no painel central mesmo
+        # na janela mínima (1200px); crescem via size policy Expanding.
+        self.setMinimumSize(188, 168)
         self.setProperty("hover", False)
 
         v = QtWidgets.QVBoxLayout(self)
@@ -2874,7 +3805,7 @@ class LauncherScreen(QtWidgets.QDialog):
     """
 
     # Sinal opcional para integrações externas
-    launch_requested = QtCore.pyqtSignal(dict)
+    launch_requested = QtCore.Signal(dict)
 
     @staticmethod
     def _shift_color(hex_color, delta):
@@ -2887,6 +3818,23 @@ class LauncherScreen(QtWidgets.QDialog):
             return c.name()
         except Exception:
             return hex_color
+
+    @staticmethod
+    def _shrink_combo(combo, min_chars=8):
+        """Evita que itens de texto longo (porta COM, nome de voluntário)
+        forcem a largura do painel lateral — o que espremia o painel central
+        e cortava os cards. O combo passa a dimensionar pelo mínimo de
+        caracteres e a encolher/elidir; o popup mantém a largura dos itens."""
+        try:
+            combo.setSizeAdjustPolicy(
+                QtWidgets.QComboBox.SizeAdjustPolicy
+                .AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(min_chars)
+            combo.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                QtWidgets.QSizePolicy.Policy.Fixed)
+            combo.setMinimumWidth(0)
+        except Exception:
+            pass
 
     def _theme(self):
         """Atalho para a paleta do tema atual + cores derivadas."""
@@ -2959,6 +3907,9 @@ class LauncherScreen(QtWidgets.QDialog):
         th = self._theme()
         panel = QtWidgets.QFrame()
         panel.setObjectName("sidePanel")
+        # Largura limitada: impede que os painéis laterais "comam" o painel
+        # central (o que cortava os cards de Analisar Dados / Modo Simulação).
+        panel.setMaximumWidth(340)
         v = QtWidgets.QVBoxLayout(panel)
         v.setContentsMargins(16, 16, 16, 16); v.setSpacing(10)
 
@@ -2986,12 +3937,6 @@ class LauncherScreen(QtWidgets.QDialog):
             f"color: {th['text_dim']}; font-size: 9pt; background: transparent;")
         sub_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         lb.addWidget(sub_lbl)
-        author_lbl = QtWidgets.QLabel(APP_AUTHORS)
-        author_lbl.setStyleSheet(
-            f"color: {th['text_dim']}; font-size: 8pt; "
-            f"font-style: italic; background: transparent;")
-        author_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        lb.addWidget(author_lbl)
         v.addWidget(logo_box)
 
         # ---- Voluntário ativo ----
@@ -3000,6 +3945,7 @@ class LauncherScreen(QtWidgets.QDialog):
         vol_row.setSpacing(6)
         self.volunteer_combo = QtWidgets.QComboBox()
         self.volunteer_combo.setObjectName("volunteerCombo")
+        self._shrink_combo(self.volunteer_combo)
         vol_row.addWidget(self.volunteer_combo, stretch=1)
         self.new_volunteer_btn = QtWidgets.QPushButton(tr("+ Novo"))
         self.new_volunteer_btn.setObjectName("smallBtn")
@@ -3050,7 +3996,10 @@ class LauncherScreen(QtWidgets.QDialog):
         subtitle.setWordWrap(True)
         v.addWidget(subtitle)
 
-        # Grid 2x2 de cards — centralizado dentro do painel
+        # Grid 2x2 de cards. Cada card EXPANDE para preencher sua coluna e o
+        # bloco é limitado em largura + centralizado por espaçadores laterais —
+        # assim os cards NUNCA estouram o painel central (o que cortava o
+        # subtítulo de "Analisar Dados" e "Modo Simulação" na coluna direita).
         cards_wrapper = QtWidgets.QWidget()
         cards = QtWidgets.QGridLayout(cards_wrapper)
         cards.setHorizontalSpacing(16); cards.setVerticalSpacing(16)
@@ -3079,13 +4028,19 @@ class LauncherScreen(QtWidgets.QDialog):
             card = _WorkflowCard(t, s, ic, col,
                                   text_color=th["text"],
                                   dim_color=th["text_dim"])
+            card.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                               QtWidgets.QSizePolicy.Policy.Expanding)
             card.clicked.connect(lambda m=mode: self._on_card_clicked(m))
             cards.addWidget(card, r, c)
             self._cards[mode] = card
         # Faz as 2 colunas e linhas terem o mesmo stretch (cards iguais)
         cards.setColumnStretch(0, 1); cards.setColumnStretch(1, 1)
         cards.setRowStretch(0, 1); cards.setRowStretch(1, 1)
-        v.addWidget(cards_wrapper, stretch=1, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+        # O bloco preenche a largura do painel central. Como os painéis
+        # laterais têm largura máxima limitada, o central sempre recebe espaço
+        # suficiente para os 2 cards lado a lado, sem corte — em qualquer
+        # tamanho de janela (>= 1200 px). Os cards crescem juntos (Expanding).
+        v.addWidget(cards_wrapper, stretch=1)
 
         return panel
 
@@ -3094,6 +4049,7 @@ class LauncherScreen(QtWidgets.QDialog):
         th = self._theme()
         panel = QtWidgets.QFrame()
         panel.setObjectName("sidePanel")
+        panel.setMaximumWidth(340)  # idem painel esquerdo (não espremer o centro)
         v = QtWidgets.QVBoxLayout(panel)
         v.setContentsMargins(16, 16, 16, 16); v.setSpacing(10)
 
@@ -3116,6 +4072,10 @@ class LauncherScreen(QtWidgets.QDialog):
         port_row = QtWidgets.QHBoxLayout(); port_row.setSpacing(6)
         port_row.addWidget(QtWidgets.QLabel(tr("Porta:")))
         self.launcher_port_combo = QtWidgets.QComboBox()
+        # Não deixar o texto longo da porta (ex.: "COM11 — Serial Padrão por
+        # link Bluetooth") forçar a largura do painel: o combo encolhe e elide,
+        # abrindo espaço para o painel central (evita corte dos cards).
+        self._shrink_combo(self.launcher_port_combo)
         port_row.addWidget(self.launcher_port_combo, stretch=1)
         self.refresh_ports_btn = QtWidgets.QPushButton(tr("Atualizar"))
         self.refresh_ports_btn.setObjectName("smallBtn")
@@ -3142,6 +4102,7 @@ class LauncherScreen(QtWidgets.QDialog):
                     f"{n} " + tr("canais") + f"  (+{mods} " +
                     (tr("módulo") if mods == 1 else tr("módulos")) + ")", n)
         self.expansion_combo.setCurrentIndex(0)  # default: 8
+        self._shrink_combo(self.expansion_combo)
         ch_row.addWidget(self.expansion_combo, stretch=1)
         hl.addLayout(ch_row)
         v.addWidget(hw_box)
@@ -3307,7 +4268,10 @@ class LauncherScreen(QtWidgets.QDialog):
         found.sort(reverse=True)
         if not found:
             it = QtWidgets.QListWidgetItem("(nenhuma sessão gravada ainda)")
-            it.setForeground(QtGui.QColor(self.LAUNCHER_TEXT_DIM))
+            try:
+                it.setForeground(QtGui.QColor(self._theme()["text_dim"]))
+            except Exception:
+                pass
             it.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
             self.recent_list.addItem(it)
             return
@@ -3718,7 +4682,16 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         self.layout_timer = QTimer(self); self.layout_timer.timeout.connect(self._update_layout_slots); self.layout_timer.start(200)
 
         sc = QtGui.QShortcut(QtGui.QKeySequence("M"), self)
-        sc.activated.connect(lambda: self._inject_marker_text("M"))
+        def _marker_hotkey():
+            # Nao roubar a tecla 'M' quando o foco esta num campo de texto
+            # (senao digitar "motor"/"estimulo"/hex injeta markers espurios).
+            fw = QtWidgets.QApplication.focusWidget()
+            if isinstance(fw, (QtWidgets.QLineEdit, QtWidgets.QTextEdit,
+                               QtWidgets.QPlainTextEdit)) or \
+               (isinstance(fw, QtWidgets.QComboBox) and fw.isEditable()):
+                return
+            self._inject_marker_text("M")
+        sc.activated.connect(_marker_hotkey)
 
         # Se o idioma persistido não for pt, retraduz toda a UI já na primeira
         # pintura. (As strings hardcoded são em pt; tr() só converte se houver
@@ -3738,6 +4711,37 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
                 hasattr(self, "_sim_overlay") and obj is getattr(self, "tabs", None)):
             self._sim_overlay.resize(self.tabs.size())
         return super().eventFilter(obj, event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        try:
+            self._update_header_responsive()
+        except Exception:
+            pass
+
+    def _update_header_responsive(self):
+        """Header responsivo: quando a barra não cabe, esconde a telemetria
+        menos crítica (nesta ordem: acelerômetro → amostras → separador → LEDs
+        por canal), preservando a MARCA/título e o resumo agregado 'Sinal OK'.
+        Evita corte/sobreposição do título em telas/headers estreitos."""
+        hw = getattr(self, "header_widget", None)
+        if hw is None:
+            return
+        optional = [w for w in (
+            getattr(self, "accel_label", None),
+            getattr(self, "samples_label", None),
+            getattr(self, "_header_sep", None),
+            getattr(self, "quality_widget", None),
+        ) if w is not None]
+        for w in optional:
+            w.setVisible(True)
+        avail = hw.width()
+        if avail <= 0:
+            return
+        for w in optional:
+            if hw.sizeHint().width() <= avail:
+                break
+            w.setVisible(False)
 
     def _update_simulation_overlay(self, mode_text=""):
         """Sinaliza o modo Simulação/Playback SEM watermark sobre a tela.
@@ -3876,7 +4880,7 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
             f"#header {{ background-color: {COLORS['surface']}; "
             f"border: 1px solid {COLORS['border']}; border-radius: 4px; }}")
         layout = QtWidgets.QHBoxLayout(self.header_widget)
-        layout.setContentsMargins(15, 10, 15, 10); layout.setSpacing(12)
+        layout.setContentsMargins(8, 6, 8, 6); layout.setSpacing(4)
         self.ufes_logo_lbl = None
         if os.path.exists(LOGO_UFES_PATH):
             self.ufes_logo_lbl = QtWidgets.QLabel()
@@ -3884,12 +4888,16 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
             self._refresh_ufes_logo_pixmap()
             layout.addWidget(self.ufes_logo_lbl)
 
-        self.title_label = QtWidgets.QLabel("◢ EEG DATA COLLECTOR")
+        self.title_label = QtWidgets.QLabel(f"◢ {APP_NAME.upper()}")
+        # Fonte via setFont (e SEM letter-spacing) para o sizeHint refletir a
+        # largura real — assim a marca não corta nem transborda sobre os badges.
+        self.title_label.setFont(
+            QtGui.QFont(FONT_UI, 15, QtGui.QFont.Weight.Bold))
         self.title_label.setStyleSheet(
-            f"color: {COLORS['accent']}; background: transparent; font-size: 16pt; "
-            f"font-weight: bold; letter-spacing: 2px; font-family: {FONT_UI_STACK};"
-            f"padding: 2px 0;")
+            f"color: {COLORS['accent']}; background: transparent; padding: 2px 0;")
         self.title_label.setMinimumHeight(34)
+        # Sem min-width: quando o header enche, o título corta graciosamente
+        # (clip do próprio QLabel) em vez de sobrepor os badges ao lado.
         layout.addWidget(self.title_label)
         layout.addStretch()
 
@@ -3926,22 +4934,23 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         self.status_label = QtWidgets.QLabel("DESCONECTADO")
         self.status_label.setStyleSheet(
             f"color: {COLORS['error']}; font-weight: bold; "
-            f"padding: 4px 14px; font-size: 11pt;")
+            f"padding: 4px 8px; font-size: 11pt;")
         self.status_label.setMinimumHeight(28)
         layout.addWidget(self.status_label)
 
-        sep = QtWidgets.QLabel("|"); sep.setStyleSheet(f"color: {COLORS['border']};")
-        layout.addWidget(sep)
+        self._header_sep = QtWidgets.QLabel("|")
+        self._header_sep.setStyleSheet(f"color: {COLORS['border']};")
+        layout.addWidget(self._header_sep)
 
         self.samples_label = QtWidgets.QLabel("Amostras: 0")
         self.samples_label.setStyleSheet(
-            f"color: {COLORS['text_dim']}; padding: 2px 10px; font-family: {FONT_DATA_STACK};")
+            f"color: {COLORS['text_dim']}; padding: 2px 5px; font-family: {FONT_DATA_STACK};")
         self.samples_label.setMinimumHeight(28)
         layout.addWidget(self.samples_label)
 
         self.accel_label = QtWidgets.QLabel("g: -.--  -.--  -.--")
         self.accel_label.setStyleSheet(
-            f"color: {COLORS['text_dim']}; padding: 2px 10px; font-family: {FONT_DATA_STACK};")
+            f"color: {COLORS['text_dim']}; padding: 2px 5px; font-family: {FONT_DATA_STACK};")
         self.accel_label.setMinimumHeight(28)
         layout.addWidget(self.accel_label)
 
@@ -3958,14 +4967,22 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
             self.quality_leds.append(led)
             ql_layout.addWidget(led)
         self.quality_widget.setToolTip(
-            "Qualidade do sinal por canal (verde=OK, amarelo=ruidoso, vermelho=ruim/saturado)"
+            "Qualidade do sinal por canal — forma+cor: ● OK, ▲ ruidoso, ■ ruim/saturado"
         )
         layout.addWidget(self.quality_widget)
+
+        # Semáforo agregado de prontidão do sinal (cor + símbolo + rótulo — WCAG)
+        self.quality_summary = QtWidgets.QLabel("Sinal: —")
+        self.quality_summary.setStyleSheet(
+            "color: #888; font-size: 9pt; font-weight: bold; padding: 0 8px;")
+        self.quality_summary.setToolTip(
+            "Prontidão geral do sinal (resumo de todos os canais ativos).")
+        layout.addWidget(self.quality_summary)
 
         # Indicador de qualidade temporal (Δt e jitter) — validação clínica
         self.timing_label = QtWidgets.QLabel("Δt: -.-- ms  ±-.-- ms")
         self.timing_label.setStyleSheet(
-            f"color: {COLORS['text_dim']}; padding: 2px 10px; font-family: {FONT_DATA_STACK};")
+            f"color: {COLORS['text_dim']}; padding: 2px 5px; font-family: {FONT_DATA_STACK};")
         self.timing_label.setMinimumHeight(28)
         self.timing_label.setToolTip(
             "Δt = média do intervalo entre amostras (esperado: "
@@ -4082,6 +5099,11 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         self.vol_table.setWordWrap(False)
         self.vol_table.itemDoubleClicked.connect(
             lambda *_: self._volunteer_select_active())
+        # Menu de clique-direito (mouse) — adicionar/selecionar/importar/deletar.
+        self.vol_table.setContextMenuPolicy(
+            QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.vol_table.customContextMenuRequested.connect(
+            self._volunteer_context_menu)
         outer.addWidget(self.vol_table, stretch=2)
 
         # Histórico do voluntário selecionado
@@ -4262,6 +5284,30 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Erro", str(exc))
 
+    def _volunteer_context_menu(self, pos):
+        """Menu de clique-direito na tabela de voluntários (interação por mouse)."""
+        row = self.vol_table.rowAt(pos.y())
+        if row >= 0:
+            self.vol_table.selectRow(row)
+        has_sel = bool(self._volunteer_selected_dirname())
+        menu = QtWidgets.QMenu(self)
+        act_new = menu.addAction("Novo voluntário")
+        act_sel = menu.addAction("Selecionar como ativo")
+        act_imp = menu.addAction("Importar exame externo…")
+        menu.addSeparator()
+        act_del = menu.addAction("Deletar voluntário")
+        for a in (act_sel, act_imp, act_del):
+            a.setEnabled(has_sel)
+        chosen = menu.exec(self.vol_table.viewport().mapToGlobal(pos))
+        if chosen == act_new:
+            self._volunteer_new_dialog()
+        elif chosen == act_sel:
+            self._volunteer_select_active()
+        elif chosen == act_imp:
+            self._volunteer_import_external()
+        elif chosen == act_del:
+            self._volunteer_delete()
+
     def _volunteer_select_active(self):
         dn = self._volunteer_selected_dirname()
         if not dn:
@@ -4353,7 +5399,7 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         note = note_edit.toPlainText().strip()
 
         # Cria diretório imported_<timestamp>/
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         # Sanitiza título para path
         safe_title = re.sub(r'[^\w\-]+', '_', title)[:40]
         vol_base = os.path.join(self.volunteers.volunteers_dir, dn)
@@ -4368,15 +5414,21 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         ext = os.path.splitext(path)[1].lower()
         try:
             import shutil
-            if ext == ".csv":
+            if ext in (".edf", ".bdf"):
+                # Converte o exame clínico p/ CSV nativo -> fica ANALISÁVEL no
+                # Offline (leitor tolerante a header quebrado). Guarda o original.
                 dest = os.path.join(target_dir, "data.csv")
+                edf_to_native_csv(path, dest)
+                shutil.copy2(path, os.path.join(target_dir, f"original{ext}"))
+            elif ext == ".csv":
+                dest = os.path.join(target_dir, "data.csv")
+                shutil.copy2(path, dest)
             else:
-                dest = os.path.join(target_dir,
-                                    f"data{ext}")
-            shutil.copy2(path, dest)
+                dest = os.path.join(target_dir, f"data{ext}")
+                shutil.copy2(path, dest)
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Erro ao copiar",
-                f"Falha ao copiar arquivo:\n{exc}")
+            QtWidgets.QMessageBox.warning(self, "Erro ao importar",
+                f"Falha ao importar arquivo:\n{exc}")
             return
         # Cria summary.json
         try:
@@ -4388,7 +5440,7 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
                 "source":        source,
                 "notes":         note,
                 "original_path": path,
-                "imported_at":   datetime.datetime.now().isoformat(timespec="seconds"),
+                "imported_at":   datetime.now().isoformat(timespec="seconds"),
                 "volunteer":     {
                     "vid":  prof.get("vid", ""),
                     "nome": prof.get("nome", ""),
@@ -4467,6 +5519,18 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
                 f"border: 1px solid {COLORS['border']}; border-radius: 3px;")
             self.vol_active_lbl.setText("Ativo: (nenhum)")
 
+    def _open_guided_stats(self):
+        """Abre o facilitador de estatística guiada (comparar grupos de sessões)."""
+        GuidedStatsDialog(self).exec()
+
+    def _open_recipe(self):
+        """Abre a Área Maker (receitas de análise composáveis e salváveis)."""
+        RecipeDialog(self).exec()
+
+    def _open_intra_stats(self):
+        """Compara as condições/classes DENTRO de uma sessão (genérico/multimodal)."""
+        IntraSessionStatsDialog(self, session=getattr(self, "_ersd_data", None)).exec()
+
     # ==================================================================
     # ABA OFFLINE — visualizador de sessões gravadas + análise por janela
     # ==================================================================
@@ -4505,18 +5569,43 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         load_man_btn = QtWidgets.QPushButton("Abrir data.csv manualmente...")
         load_man_btn.clicked.connect(self._offline_load_manual_csv)
         ctrl.addWidget(load_man_btn)
+        edf_btn = QtWidgets.QPushButton("Abrir EDF/BDF (reparo automático)...")
+        edf_btn.setToolTip(
+            "Abre exames clínicos .edf/.bdf (ex.: iCelera, BioWave) e converte "
+            "para análise. Leitor TOLERANTE: lê MESMO com o cabeçalho quebrado "
+            "(ex.: acento no nome do paciente) que faz o EDFbrowser recusar.")
+        edf_btn.clicked.connect(self._offline_open_edf)
+        ctrl.addWidget(edf_btn)
+        stats_btn = QtWidgets.QPushButton("Estatística guiada (comparar grupos)")
+        stats_btn.setToolTip(
+            "Compara grupos de sessões (ex.: Antes × Depois), escolhe o teste "
+            "estatístico adequado, monta a tabela e explica o resultado — sem "
+            "exigir conhecimento prévio de estatística.")
+        stats_btn.clicked.connect(self._open_guided_stats)
+        ctrl.addWidget(stats_btn)
+        intra_btn = QtWidgets.QPushButton("Comparar condições da sessão")
+        intra_btn.setToolTip(
+            "Compara as condições/classes marcadas DENTRO de uma sessão (sejam "
+            "quais forem — dorsi/plantar, mãos, etc.) pela métrica que você "
+            "escolher (banda EEG, RMS, ERD%). Genérico/multimodal; escolhe o "
+            "teste estatístico sozinho.")
+        intra_btn.clicked.connect(self._open_intra_stats)
+        ctrl.addWidget(intra_btn)
+        recipe_btn = QtWidgets.QPushButton("Receitas de análise (Área Maker)")
+        recipe_btn.setToolTip(
+            "Área Maker: monte um pipeline de análise (métrica + banda + canais), "
+            "rode em 1+ sessões e SALVE como receita .json reutilizável/compartilhável.")
+        recipe_btn.clicked.connect(self._open_recipe)
+        ctrl.addWidget(recipe_btn)
         # Botão ICA (MNE) — limpeza de artefatos
-        self.offline_ica_btn = QtWidgets.QPushButton("Limpar artefatos (ICA via MNE)")
+        self.offline_ica_btn = QtWidgets.QPushButton("Limpar artefatos (ICA)")
         self.offline_ica_btn.setToolTip(
-            "Roda Independent Component Analysis (ICA) usando MNE-Python:\n"
-            "  1. Bandpass 1-40 Hz\n  2. FastICA com 15 componentes\n"
-            "  3. Auto-detecta componentes de blink em canais Fp1/Fp2\n"
-            "  4. Salva sinal limpo como data_clean.csv na pasta da sessão"
-        )
+            "Remove piscadas por ICA (FastICA em numpy puro — NÃO precisa de MNE "
+            "nem 'pip install', funciona direto no .exe):\n"
+            "  1. Bandpass 1-40 Hz\n  2. FastICA (até 15 componentes)\n"
+            "  3. Detecta o componente ocular (frontal Fp1/Fp2 ou curtose)\n"
+            "  4. Reconstrói e salva data_clean.csv na pasta da sessão")
         self.offline_ica_btn.clicked.connect(self._offline_run_ica)
-        if not HAS_MNE:
-            self.offline_ica_btn.setEnabled(False)
-            self.offline_ica_btn.setText("ICA indisponível (pip install mne)")
         ctrl.addWidget(self.offline_ica_btn)
         ctrl.addStretch()
         self.offline_status_lbl = QtWidgets.QLabel("Nenhuma sessão carregada.")
@@ -4780,13 +5869,8 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         self._offline_load_csv(csv_path)
 
     def _offline_run_ica(self):
-        """Roda ICA via MNE-Python na sessão atualmente carregada no Offline."""
-        if not HAS_MNE:
-            QtWidgets.QMessageBox.information(
-                self, "ICA indisponível",
-                "Instale MNE-Python:\n\n    pip install mne scikit-learn"
-            )
-            return
+        """Remove piscadas por ICA (FastICA em numpy PURO) na sessão carregada.
+        NÃO precisa de MNE nem 'pip install' — funciona direto no .exe."""
         if not getattr(self, "_offline_data", None):
             QtWidgets.QMessageBox.information(
                 self, "Sem sessão",
@@ -4809,65 +5893,41 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.StandardButton.No)
         if confirm != QtWidgets.QMessageBox.StandardButton.Yes: return
         try:
-            import mne  # lazy: MNE é pesado, só carrega ao rodar ICA
-            self.offline_status_lbl.setText("Rodando ICA via MNE (pode demorar)...")
+            self.offline_status_lbl.setText("Rodando ICA (FastICA numpy)...")
             self.offline_status_lbl.setStyleSheet(f"color: {COLORS['warning']};")
             QtWidgets.QApplication.processEvents()
-            # Cria Raw MNE
-            data_V = d["eeg"] * 1e-6
-            info = mne.create_info(ch_names=d["ch_names"], sfreq=d["sr"],
-                                    ch_types=["eeg"] * n_ch)
-            raw = mne.io.RawArray(data_V, info, verbose=False)
-            raw.filter(1.0, 40.0, fir_design="firwin", verbose=False)
-            # ICA
-            n_components = min(15, n_ch - 1)
-            ica = mne.preprocessing.ICA(
-                n_components=n_components, random_state=42,
-                max_iter="auto", method="fastica", verbose=False)
-            ica.fit(raw)
-            # Auto-detecta blinks
-            eog_chs = [c for c in ("Fp1", "Fp2") if c in d["ch_names"]]
-            excluded = []
-            if eog_chs:
-                try:
-                    eog_inds, _ = ica.find_bads_eog(raw, ch_name=eog_chs[0],
-                                                     verbose=False)
-                    excluded = list(eog_inds)
-                except Exception: pass
-            ica.exclude = excluded
-            raw_clean = ica.apply(raw.copy(), verbose=False)
-            # Reescreve no _offline_data
-            cleaned_uV = raw_clean.get_data() * 1e6
+            sr = d.get("sr", SAMPLE_RATE)
+            cleaned_uV, excluded, info = ica_clean_eog(
+                np.asarray(d["eeg"], dtype=float), sr, d["ch_names"])
             d["eeg"] = cleaned_uV
             d["ica_applied"] = True
             d["ica_excluded"] = excluded
-            # Salva CSV limpo
+            # Salva CSV limpo (formato nativo)
             try:
-                csv_path = d.get("csv_path") or os.path.join(
-                    d.get("path", self.config.save_directory), "data_clean.csv")
-                base_dir = os.path.dirname(csv_path)
+                base_dir = (os.path.dirname(d.get("csv_path") or "")
+                            or d.get("path") or self.config.save_directory)
                 clean_path = os.path.join(base_dir, "data_clean.csv")
-                with open(clean_path, "w", encoding="utf-8") as f:
-                    header = ["time_s"] + [f"{n}_uV" for n in d["ch_names"]] + ["marker"]
-                    f.write(",".join(header) + "\n")
-                    n_s = cleaned_uV.shape[1]
-                    t_axis = np.arange(n_s) / d["sr"]
-                    for i in range(n_s):
-                        row = [f"{t_axis[i]:.4f}"] + [f"{cleaned_uV[c, i]:.4f}" for c in range(n_ch)] + [""]
-                        f.write(",".join(row) + "\n")
-                self._log(f"ICA aplicada: {len(excluded)} componente(s) excluído(s). "
+                header = "time_s," + ",".join(f"{nm}_uV" for nm in d["ch_names"])
+                t_axis = (np.arange(cleaned_uV.shape[1]) / sr).reshape(-1, 1)
+                np.savetxt(clean_path, np.column_stack([t_axis, cleaned_uV.T]),
+                           delimiter=",", header=header, comments="",
+                           fmt=["%.6f"] + ["%.6g"] * n_ch)
+                self._log(f"ICA aplicada: {len(excluded)} componente(s) removido(s). "
                           f"Salvo em {clean_path}")
             except Exception as exc:
                 self._log(f"ICA OK em memória, mas falha ao salvar: {exc}", error=True)
-            # Atualiza plots
             self._offline_update_region_analysis()
             self.offline_status_lbl.setText(
-                f"ICA aplicada: {len(excluded)} componente(s) excluído(s)."
-            )
+                f"ICA aplicada: {len(excluded)} componente(s) de piscada removido(s)."
+                if excluded else
+                "ICA rodou: nenhum componente ocular forte (sinal já parece limpo).")
             self.offline_status_lbl.setStyleSheet(
                 f"color: {SIGNAL_TYPE_COLORS['EEG']}; font-weight: bold;")
-            self._audit_event("ica_applied",
-                              excluded=excluded, n_components=n_components)
+            try:
+                self._audit_event("ica_applied", excluded=excluded,
+                                  n_components=info.get("n_components"))
+            except Exception:
+                pass
         except Exception as exc:
             self.offline_status_lbl.setText(f"Erro ICA: {exc}")
             self.offline_status_lbl.setStyleSheet(f"color: {COLORS['error']};")
@@ -4879,6 +5939,43 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
             self.config.save_directory, "CSV (*.csv);;Todos (*)")
         if path:
             self._offline_load_csv(path)
+
+    def _offline_open_edf(self):
+        """Abre um EDF/BDF (leitor tolerante), converte p/ CSV nativo e carrega
+        no Offline. Lê exames clínicos MESMO com header não-ASCII quebrado."""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Abrir exame EDF/BDF para análise",
+            os.path.expanduser("~"),
+            "EEG clínico (*.edf *.bdf *.EDF *.BDF);;Todos (*)")
+        if not path:
+            return
+        try:
+            base = os.path.join(self.config.save_directory, "importados_edf")
+            os.makedirs(base, exist_ok=True)
+            stem = re.sub(r"[^\w\-]+", "_",
+                          os.path.splitext(os.path.basename(path))[0])[:50] or "exame"
+            out_dir = os.path.join(
+                base, f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            os.makedirs(out_dir, exist_ok=True)
+            out_csv = os.path.join(out_dir, "data.csv")
+            _, labels, fs, n = edf_to_native_csv(path, out_csv)
+            self._log(f"EDF importado: {os.path.basename(path)} -> "
+                      f"{len(labels)} canais @ {fs} Hz, {n} amostras "
+                      f"({n / fs:.0f}s).")
+        except Exception as exc:
+            logging.getLogger("eeg").exception("Falha lendo EDF")
+            QtWidgets.QMessageBox.critical(
+                self, "Erro ao ler EDF",
+                f"Não foi possível ler o arquivo EDF/BDF:\n{exc}")
+            return
+        self._offline_load_csv(out_csv)         # reaproveita o pipeline offline
+        QtWidgets.QMessageBox.information(
+            self, "EDF importado",
+            f"Exame lido e convertido com sucesso:\n\n"
+            f"• {len(labels)} canais a {fs} Hz\n"
+            f"• {n / fs:.0f} s de sinal\n\n"
+            f"Carregado no modo Offline. Arraste a região no gráfico para "
+            f"selecionar uma janela e ver FFT/bandas/estatísticas.")
 
     def _offline_load_csv(self, csv_path):
         """Carrega o CSV e popula o viewer com todos os canais (montage style)."""
@@ -4987,20 +6084,27 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         else:
             self.offline_fft_curve.setData([], [])
             self.offline_bands_bars.setOpts(height=[0.0] * len(EEG_BANDS))
-        # Stats por canal
+        # Stats por canal — garante linhas/itens suficientes p/ a sessao carregada
+        # (sessao pode ter mais canais que as linhas iniciais da tabela -> item None).
         n_ch = eeg.shape[0]
+        tbl = self.offline_stats_table
+        if tbl.rowCount() < n_ch:
+            tbl.setRowCount(n_ch)
         for c in range(n_ch):
+            for col in range(4):
+                if tbl.item(c, col) is None:
+                    tbl.setItem(c, col, QtWidgets.QTableWidgetItem())
             seg = eeg[c, i0:i1] if (i1 - i0) >= 2 else np.array([])
             stats = SignalProcessor.compute_statistics(seg) if seg.size else {
                 "mean": 0, "std": 0, "rms": 0}
-            self.offline_stats_table.item(c, 0).setText(names[c])
-            self.offline_stats_table.item(c, 0).setForeground(
+            tbl.item(c, 0).setText(names[c] if c < len(names) else f"CH{c+1}")
+            tbl.item(c, 0).setForeground(
                 QtGui.QColor(CHANNEL_COLORS[c] if c < len(CHANNEL_COLORS) else "#fff"))
-            self.offline_stats_table.item(c, 1).setText(f"{stats['mean']:+.2f}")
-            self.offline_stats_table.item(c, 2).setText(f"{stats['std']:.2f}")
-            self.offline_stats_table.item(c, 3).setText(f"{stats['rms']:.2f}")
+            tbl.item(c, 1).setText(f"{stats['mean']:+.2f}")
+            tbl.item(c, 2).setText(f"{stats['std']:.2f}")
+            tbl.item(c, 3).setText(f"{stats['rms']:.2f}")
             for col in (1, 2, 3):
-                self.offline_stats_table.item(c, col).setTextAlignment(
+                tbl.item(c, col).setTextAlignment(
                     QtCore.Qt.AlignmentFlag.AlignCenter)
 
     # ==================================================================
@@ -6444,6 +7548,8 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
             plot.setLabel("bottom", "Tempo", units="s")
             plot.getAxis("bottom").setHeight(22)
             curve = plot.plot(pen=pg.mkPen(CHANNEL_COLORS[ch], width=1.2))
+            curve.setDownsampling(auto=True, method="peak")  # menos CPU sem perda visual
+            curve.setClipToView(True)
             self.channel_plots.append(plot)
             self.channel_curves.append(curve)
         self.rt_view_stack.addWidget(self.channels_scroll)
@@ -6468,6 +7574,8 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         self.accel_curves = []
         for i, axis in enumerate(("X", "Y", "Z")):
             curve = self.accel_plot.plot(pen=pg.mkPen(accel_colors[i], width=1.4), name=axis)
+            curve.setDownsampling(auto=True, method="peak")
+            curve.setClipToView(True)
             self.accel_curves.append(curve)
         al.addWidget(self.accel_plot)
         splitter.addWidget(accel_widget)
@@ -6606,6 +7714,23 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         self.topo_band_combo.addItems(list(EEG_BANDS.keys()))
         self.topo_band_combo.setCurrentText("Alpha")
         ctrl_row.addWidget(self.topo_band_combo)
+        ctrl_row.addSpacing(16)
+        ctrl_row.addWidget(QtWidgets.QLabel("Mapa:"))
+        self.topo_mode_combo = QtWidgets.QComboBox()
+        self.topo_mode_combo.addItems(["Interpolado (potencial)",
+                                       "CSD / Laplaciano (fonte)"])
+        self.topo_mode_combo.setToolTip(
+            "Interpolado = potência de escalpo (IDW).\n"
+            "CSD/Laplaciano = realça fontes locais e reduz condução de volume\n"
+            "(McFarland 1997; Nunez & Srinivasan 2006).")
+        self.topo_mode_combo.currentTextChanged.connect(
+            lambda t: self.head_plot.set_map_mode("csd" if "CSD" in t else "interp"))
+        ctrl_row.addWidget(self.topo_mode_combo)
+        self.topo_loreta_btn = QtWidgets.QPushButton("vs LORETA / MNE…")
+        self.topo_loreta_btn.setToolTip("Como este mapa se compara a LORETA/sLORETA "
+                                        "e localização de fonte 3D.")
+        self.topo_loreta_btn.clicked.connect(self._show_topo_methods_info)
+        ctrl_row.addWidget(self.topo_loreta_btn)
         ctrl_row.addStretch()
         ctrl_row.addWidget(QtWidgets.QLabel("Canal para Focus:"))
         self.topo_channel_combo = QtWidgets.QComboBox()
@@ -6637,6 +7762,46 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         main_split.setSizes([800, 600])
         layout.addWidget(main_split)
         return widget
+
+    def _show_topo_methods_info(self):
+        """Comparação honesta: topomap × CSD × LORETA/sLORETA × MNE/EEGLAB."""
+        acc = COLORS.get("accent", "#0f9d75")
+        html = (
+            "<h3 style='color:%s'>Análise visual: o que cada método mostra</h3>"
+            "<p><b>1) Interpolado (potencial):</b> projeta a potência por eletrodo "
+            "numa vista da cabeça (IDW). Rápido para ver <i>onde</i> há atividade, "
+            "mas é <b>potencial de escalpo</b> — sofre de <b>condução de volume</b> "
+            "(a fonte real fica 'borrada').</p>"
+            "<p><b>2) CSD / Laplaciano de superfície</b> (este software): realça "
+            "<b>fontes locais</b> e reduz a condução de volume usando só a geometria "
+            "dos eletrodos — é uma referência espacial 'sem referência'. Melhora muito "
+            "a nitidez do mapa. <i>[McFarland 1997; Nunez &amp; Srinivasan 2006]</i></p>"
+            "<p><b>3) LORETA / sLORETA</b> (localização de fonte 3D): estima a "
+            "distribuição de corrente <b>dentro do volume cerebral</b>. LORETA assume "
+            "solução suave; sLORETA é padronizada, com erro de localização zero para "
+            "fonte única. Requer <b>modelo de cabeça/leadfield</b>. "
+            "<i>[Pascual-Marqui 1994; 2002]</i></p>"
+            "<hr><p><b>Comparação honesta:</b> o OpenBionica é um "
+            "coletor+analisador leve (topomap 2D, CSD, FFT, bandas, ERS/ERD). "
+            "Tomografia de fonte 3D (LORETA/sLORETA) é o domínio do "
+            "<b>MNE-Python</b> <i>[Gramfort 2013]</i> e do <b>EEGLAB</b> "
+            "<i>[Delorme 2004]</i>.</p>"
+            "<p><b>Caminho recomendado:</b> use o OpenBionica para "
+            "coleta/triagem visual (incl. CSD) e <b>exporte para MNE/EEGLAB</b> "
+            "(o software já exporta EDF/BIDS) quando precisar de fonte 3D.</p>"
+            % acc)
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Métodos de análise visual — comparação")
+        dlg.setMinimumSize(600, 520)
+        v = QtWidgets.QVBoxLayout(dlg)
+        tb = QtWidgets.QTextBrowser(); tb.setHtml(html); tb.setOpenExternalLinks(True)
+        v.addWidget(tb, 1)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(dlg.reject); bb.accepted.connect(dlg.accept)
+        v.addWidget(bb)
+        try: dlg.setStyleSheet(build_stylesheet(COLORS))
+        except Exception: pass
+        dlg.exec()
 
     # ---- Tab: Espectrograma ----
     def _build_spectrogram_tab(self):
@@ -8327,12 +9492,23 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
     def _pan_tompkins_detect(self, signal, fs):
         """Pan-Tompkins simplificado. Retorna (indices_dos_picos_R, mwa_signal, threshold).
 
-        Etapas: bandpass 5-15 Hz (assumido já feito) -> derivada -> quadrado
+        Etapas: bandpass 5-15 Hz (aplicado aqui) -> derivada -> quadrado
         -> média móvel ~150ms -> threshold adaptativo + refratário 200ms.
         """
         n = len(signal)
         if n < int(fs * 0.5):
             return np.array([], dtype=int), np.zeros(n), 0.0
+        signal = np.asarray(signal, dtype=float)
+        # Bandpass 5-15 Hz do Pan-Tompkins — NAO assume filtragem previa (o filtro
+        # global do app e banda-EEG); remove deriva de linha de base e ruido alto.
+        try:
+            ny = 0.5 * fs
+            lo, hi = 5.0 / ny, min(15.0, ny * 0.95) / ny
+            if 0 < lo < hi < 1 and np.all(np.isfinite(signal)):
+                b, a = scipy_signal.butter(2, [lo, hi], btype="band")
+                signal = scipy_signal.filtfilt(b, a, signal)
+        except Exception:
+            pass
         # Derivada
         diff = np.diff(signal, prepend=signal[0])
         # Quadrado
@@ -8510,7 +9686,10 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
                             lf_p = float(_TRAPEZOID(psd[lf_mask], freqs[lf_mask])) if lf_mask.any() else 0
                             hf_p = float(_TRAPEZOID(psd[hf_mask], freqs[hf_mask])) if hf_mask.any() else 0
                             ratio = lf_p / max(hf_p, 1e-9)
-                            self.ecg_lfhf_lbl.setText(f"LF/HF: {ratio:.2f}")
+                            # Validade: LF/HF confiavel exige ~2 min de RR (>=120
+                            # batimentos). Em janela curta, sinaliza a limitacao.
+                            caveat = "  ⚠ janela curta" if len(rr_ms) < 120 else ""
+                            self.ecg_lfhf_lbl.setText(f"LF/HF: {ratio:.2f}{caveat}")
                     except Exception:
                         pass
 
@@ -8521,7 +9700,8 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
                         # Poincaré SD1, SD2 (Brennan 2001)
                         diff = np.diff(rr_arr)
                         sd1 = float(np.std(diff) / np.sqrt(2.0))
-                        sd2 = float(np.sqrt(2 * np.var(rr_arr) - 0.5 * np.var(diff)))
+                        sd2 = float(np.sqrt(max(0.0, 2 * np.var(rr_arr)
+                                               - 0.5 * np.var(diff))))
                         sd_ratio = sd1 / max(sd2, 1e-9)
                         if hasattr(self, "ecg_poincare_sd_lbl"):
                             self.ecg_poincare_sd_lbl.setText(
@@ -8916,10 +10096,12 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         self.eog_v_curve.setData(t_axis, sig_v)
 
         th = self.eog_threshold_spin.value()
-        # Direção atual: média dos últimos 250 ms
+        # Direção atual: média dos últimos 250 ms, RELATIVA à baseline (mediana do
+        # buffer) — remove a deriva lenta que travava a direção em Cima/Baixo.
         n_recent = int(SAMPLE_RATE * 0.25)
-        h_mean = float(np.mean(sig_h[-n_recent:]))
-        v_mean = float(np.mean(sig_v[-n_recent:]))
+        h_base = float(np.median(sig_h)); v_base = float(np.median(sig_v))
+        h_mean = float(np.mean(sig_h[-n_recent:])) - h_base
+        v_mean = float(np.mean(sig_v[-n_recent:])) - v_base
         # Decisão direção
         if   v_mean >  th: direction = "Cima"
         elif v_mean < -th: direction = "Baixo"
@@ -8936,7 +10118,7 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         # picos antigos.
         n = len(sig_v)
         win = min(n, int(SAMPLE_RATE * 1.5))
-        local = sig_v[-win:]
+        local = sig_v[-win:] - v_base          # relativo à baseline (sem deriva)
         peaks_h = []
         thr_blink = th * 1.5
         for i in range(1, len(local) - 1):
@@ -8950,6 +10132,9 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
             if not self._eog_blink_times or (t_p - self._eog_blink_times[-1]) > 0.2:
                 self._eog_blink_times.append(t_p)
                 self._eog_blink_count += 1
+        # Limita a lista (memória; evita a taxa fossilizar em sessão longa)
+        if len(self._eog_blink_times) > 500:
+            self._eog_blink_times = self._eog_blink_times[-500:]
         # Filtra apenas blinks nos últimos 10s (janela visível)
         last_t = float(t_axis[-1])
         visible_blinks = [t for t in self._eog_blink_times if (last_t - t) < BUFFER_SECONDS]
@@ -9969,6 +11154,24 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
                     "Verifique se selecionou um arquivo válido.")
         return None
 
+    def _notify_error(self, code, detail="", exc=None, blocking=None):
+        """Sinaliza um erro catalogado (Erro E0XX) ao usuário: SEMPRE loga e
+        reflete na barra de status; abre diálogo modal se for bloqueante."""
+        title, _msg, blk = error_info(code)
+        if blocking is None:
+            blocking = blk
+        try:
+            if hasattr(self, "status_state_lbl"):
+                self.status_state_lbl.setText(f"⚠ Erro {code}: {title}")
+            self.statusBar().showMessage(f"Erro {code}: {title}", 8000)
+        except Exception:
+            pass
+        if blocking:
+            notify_error(code, detail, parent=self, exc=exc, blocking=True)
+        else:
+            logging.getLogger("eeg").warning(
+                "[%s] %s%s", code, title, (" | " + str(detail)) if detail else "")
+
     def _on_playback_progress(self, frac):
         self.playback_progress.setValue(int(frac * 1000))
 
@@ -9996,7 +11199,16 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
 
         try:
             sample = self.filters.apply_sample(sample)
-        except Exception: pass
+        except Exception as exc:
+            # NAO engolir em silencio: do contrario gravariamos a amostra CRUA
+            # rotulada como filtrada. Conta, marca a sessao como degradada e
+            # loga com throttle (1a falha + a cada 250).
+            self._filter_fail_count = getattr(self, "_filter_fail_count", 0) + 1
+            self._filter_degraded = True
+            if self._filter_fail_count == 1 or self._filter_fail_count % 250 == 0:
+                logging.getLogger("eeg").warning(
+                    "Falha na filtragem em tempo real (#%d): %s — amostra gravada CRUA",
+                    self._filter_fail_count, exc)
         self.last_accel = accel
         n = len(sample)
         # Buffer EEG (preenche só os canais ativos)
@@ -10058,7 +11270,7 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
 
         # Histórico sempre atualiza (aba Histórico) + Individual se ativo.
         # Protegido: uma falha num canal não pode derrubar o timer de 50ms
-        # (no PyQt6 uma exceção não tratada num slot de timer pode abortar o app).
+        # (no PySide6 uma exceção não tratada num slot de timer pode abortar o app).
         try:
             for ch in range(MAX_CHANNELS):
                 active = (ch < self.num_channels and self.channel_active[ch])
@@ -10243,6 +11455,9 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         last = data[:, -int(SAMPLE_RATE * 2):]  # últimos 2s
         # Faixas absolutas — Cyton: signal aceitável típico é ~10–80 µV RMS
         # Saturação: >2000 µV pico-a-pico = ruim
+        # Cores semânticas (escurecidas p/ contraste tanto no claro quanto no
+        # escuro) e SÍMBOLO por estado (acessibilidade — não depender só de cor).
+        n_ok = n_noisy = n_bad = 0
         for ch in range(MAX_CHANNELS):
             if ch >= self.num_channels:
                 self.quality_leds[ch].setVisible(False)
@@ -10263,20 +11478,52 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
                     line_ratio = line_pwr / max(total_pwr, 1e-12)
                 else:
                     line_ratio = 0.0
-                # Classificação heurística
+                # Classificação heurística -> (cor, símbolo, severidade, texto)
                 if pp > 2000 or rms > 500:
-                    color, status = "#ff3355", f"SATURADO (pp={pp:.0f}µV)"
+                    color, glyph, sev, status = ("#d4364f", "■", "bad",
+                        f"SATURADO (pp={pp:.0f}µV)")
                 elif rms < 0.5:
-                    color, status = "#ff3355", f"FLAT (rms={rms:.2f}µV)"
+                    color, glyph, sev, status = ("#d4364f", "■", "bad",
+                        f"FLAT (rms={rms:.2f}µV)")
                 elif line_ratio > 0.40 or rms > 150:
-                    color, status = "#ffaa00", f"RUIDOSO (rms={rms:.0f}µV, rede {line_ratio*100:.0f}%)"
+                    color, glyph, sev, status = ("#d68a00", "▲", "noisy",
+                        f"RUIDOSO (rms={rms:.0f}µV, rede {line_ratio*100:.0f}%)")
                 else:
-                    color, status = "#22dd33", f"OK (rms={rms:.0f}µV)"
+                    color, glyph, sev, status = ("#1d9e75", "●", "ok",
+                        f"OK (rms={rms:.0f}µV)")
+                if sev == "bad":      n_bad += 1
+                elif sev == "noisy":  n_noisy += 1
+                else:                 n_ok += 1
                 ele = self.config.channel_mapping[ch] if ch < len(self.config.channel_mapping) else f"CH{ch+1}"
-                self.quality_leds[ch].setStyleSheet(f"color: {color}; font-size: 12pt;")
+                self.quality_leds[ch].setText(glyph)
+                self.quality_leds[ch].setStyleSheet(f"color: {color}; font-size: 11pt;")
                 self.quality_leds[ch].setToolTip(f"CH{ch+1} ({ele}): {status}")
             except Exception:
                 pass
+
+        # ---- Semáforo agregado "Pronto para gravar" (cor + símbolo + rótulo) ----
+        if hasattr(self, "quality_summary"):
+            active = n_ok + n_noisy + n_bad
+            if active == 0:
+                txt, col, tip = "—", "#888", "Sinal: aguardando dados"
+            elif n_bad:
+                txt, col = f"■ {n_bad} ruim", "#d4364f"
+                tip = f"Sinal: {n_bad} canal(is) ruim/saturado — verifique eletrodos"
+            elif n_noisy:
+                txt, col = f"▲ {n_noisy} ruidoso{'s' if n_noisy > 1 else ''}", "#d68a00"
+                tip = f"Sinal: {n_noisy} canal(is) ruidoso(s) — atenção"
+            else:
+                txt, col, tip = "● Sinal OK", "#1d9e75", "Sinal pronto para gravar"
+            self.quality_summary.setText(txt)
+            self.quality_summary.setToolTip(tip)
+            self.quality_summary.setStyleSheet(
+                f"color: {col}; font-size: 9pt; font-weight: bold; padding: 0 8px;")
+        # Re-flui o header responsivo: a telemetria muda de largura ao longo da
+        # sessão (Amostras, g, drift) sem disparar resize — reavaliamos aqui.
+        try:
+            self._update_header_responsive()
+        except Exception:
+            pass
 
     # ==================================================================
     # Markers
@@ -10413,6 +11660,7 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
             self.log_file = open(log_path, "w", encoding="utf-8")
             self.log_file.write(
                 f"=== Sessão '{self.session_name}' iniciada em {datetime.now().isoformat()} ===\n"
+                f"Gerado por: {APP_NAME} v{APP_VERSION} ({APP_EDITION}) — {CODE_URL}\n"
                 f"Sujeito: {self.config.subject or '(não informado)'}\n"
                 f"Porta/modo: {self.port_combo.currentText()} | {self.mode_combo.currentText()}\n"
                 f"Baud: {self.baud_combo.currentText()}\n"
@@ -10434,6 +11682,14 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
             try:
                 with open(meta_path, "w", encoding="utf-8") as f:
                     json.dump({
+                        # Proveniencia (reprodutibilidade/auditoria): qual versao
+                        # do app e de onde veio o codigo geraram este registro.
+                        "generated_by": {
+                            "app":          APP_NAME,
+                            "app_version":  APP_VERSION,
+                            "app_edition":  APP_EDITION,
+                            "code_url":     CODE_URL,
+                        },
                         "session_name": self.session_name,
                         "started_at":   datetime.now().isoformat(),
                         "subject":      self.config.subject,
@@ -11101,7 +12357,7 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
             f"color: {COLORS['text_dim']}; padding: 0 8px;")
         sb.addWidget(self.status_state_lbl, stretch=1)
         version_lbl = QtWidgets.QLabel(
-            f"{APP_NAME} v{APP_VERSION}  ·  {APP_AUTHORS}")
+            f"{APP_NAME} v{APP_VERSION}")
         version_lbl.setStyleSheet(
             f"color: {COLORS['text_dim']}; padding: 0 8px;")
         sb.addPermanentWidget(version_lbl)
@@ -11117,15 +12373,35 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
             f"color: {COLORS['text']}; border: 1px solid {COLORS['border']}; }}"
             f"QMenu::item:selected {{ background-color: {COLORS['accent_dim']}; "
             f"color: {COLORS['background']}; }}")
+        tools_menu = menubar.addMenu("Ferramentas")
+        act_prof_exp = tools_menu.addAction("Exportar perfil de protocolo...")
+        act_prof_exp.triggered.connect(self._export_protocol_profile)
+        act_prof_imp = tools_menu.addAction("Importar perfil de protocolo...")
+        act_prof_imp.triggered.connect(self._import_protocol_profile)
+        tools_menu.addSeparator()
+        act_maker = tools_menu.addAction("Área Maker (receitas de análise)...")
+        act_maker.triggered.connect(self._open_recipe)
+        act_logs = tools_menu.addAction("Abrir pasta de logs")
+        act_logs.triggered.connect(self._open_logs_dir)
         help_menu = menubar.addMenu("Ajuda")
+        act_help = help_menu.addAction("Assistente de ajuda...")
+        act_help.setShortcut("F1")
+        act_help.triggered.connect(self._show_help_assistant)
+        help_menu.addSeparator()
         act_about = help_menu.addAction("Sobre o aplicativo...")
-        act_about.setShortcut("F1")
         act_about.triggered.connect(self._show_about_dialog)
         act_shortcuts = help_menu.addAction("Atalhos de teclado")
         act_shortcuts.triggered.connect(self._show_shortcuts_dialog)
         help_menu.addSeparator()
         act_docs = help_menu.addAction("Pasta de configuração / sessões")
         act_docs.triggered.connect(self._open_save_dir)
+        act_terms = help_menu.addAction("Termo de uso e privacidade...")
+        act_terms.triggered.connect(self._show_terms_dialog)
+        help_menu.addSeparator()
+        act_update = help_menu.addAction("Verificar atualizações...")
+        act_update.triggered.connect(self._check_updates_manual)
+        act_diag = help_menu.addAction("Diagnóstico de erros (simular)...")
+        act_diag.triggered.connect(self._show_error_diagnostics)
 
         # ---- Atalhos de teclado ----
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+R"), self,
@@ -11153,7 +12429,7 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
             # Pasta de destino
             shots_dir = os.path.join(self.config.save_directory, "screenshots")
             os.makedirs(shots_dir, exist_ok=True)
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             # Nome da aba atual (para nome do arquivo)
             tab_name = "tab"
             try:
@@ -11346,6 +12622,187 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
                 import subprocess; subprocess.Popen(["xdg-open", path])
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Abrir pasta", str(exc))
+
+    def _open_logs_dir(self):
+        """Abre a pasta de logs (Documentos/EEG_Coletor/logs)."""
+        path = os.path.join(DOC_DIR, "logs")
+        try:
+            os.makedirs(path, exist_ok=True)
+            if sys.platform.startswith("win"):
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                import subprocess; subprocess.Popen(["open", path])
+            else:
+                import subprocess; subprocess.Popen(["xdg-open", path])
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Abrir pasta", str(exc))
+
+    def _export_protocol_profile(self):
+        """Exporta a montagem/setup (mapeamento, tipos de sinal, EMG, impedância)
+        como um perfil .json reutilizável entre máquinas."""
+        prof = {
+            "profile_version": "1.0",
+            "channel_mapping": self.config.channel_mapping,
+            "channel_signal_types": self.config.channel_signal_types,
+            "emg_threshold_uV": self.config.emg_threshold_uV,
+            "emg_channel_muscle": self.config.emg_channel_muscle,
+            "emg_channel_mvc_uV": self.config.emg_channel_mvc_uV,
+            "emg_envelope_method": self.config.emg_envelope_method,
+            "emg_envelope_window_ms": self.config.emg_envelope_window_ms,
+            "imp_good_max": self.config.imp_good_max,
+            "imp_acceptable_max": self.config.imp_acceptable_max,
+        }
+        p, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Exportar perfil de protocolo", "perfil_protocolo.json",
+            "Perfil (*.json)")
+        if not p:
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(prof, f, ensure_ascii=False, indent=2)
+            QtWidgets.QMessageBox.information(self, "Perfil de protocolo",
+                                              f"Perfil salvo:\n{p}")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Perfil de protocolo",
+                                          f"Falha ao salvar: {exc}")
+
+    def _import_protocol_profile(self):
+        """Importa um perfil de protocolo .json (validação defensiva), salva no
+        config e pede para reabrir para aplicar tudo."""
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Importar perfil de protocolo", "", "Perfil (*.json)")
+        if not p:
+            return
+        try:
+            with open(p, encoding="utf-8") as f:
+                prof = json.load(f)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Perfil de protocolo",
+                                          f"Falha ao ler: {exc}")
+            return
+        cm = prof.get("channel_mapping")
+        if isinstance(cm, list) and len(cm) == len(self.config.channel_mapping):
+            self.config.channel_mapping = cm
+        for key in ("channel_signal_types", "emg_threshold_uV",
+                    "emg_channel_muscle", "emg_channel_mvc_uV"):
+            v = prof.get(key)
+            if isinstance(v, list):
+                setattr(self.config, key, v)
+        if isinstance(prof.get("emg_envelope_method"), str):
+            self.config.emg_envelope_method = prof["emg_envelope_method"]
+        for key in ("emg_envelope_window_ms", "imp_good_max", "imp_acceptable_max"):
+            try:
+                setattr(self.config, key,
+                        type(getattr(self.config, key))(prof[key]))
+            except Exception:
+                pass
+        self.config.save()
+        QtWidgets.QMessageBox.information(
+            self, "Perfil de protocolo",
+            "Perfil importado e salvo. Reabra o programa para aplicar totalmente "
+            "(mapeamento e tipos de sinal).")
+
+    def _show_help_assistant(self):
+        """Abre o assistente de ajuda OFFLINE (chat de FAQ + erros, sem internet)."""
+        HelpAssistantDialog(self).exec()
+
+    def _show_error_diagnostics(self):
+        """Abre o catálogo de erros para consultar/simular as notificações."""
+        ErrorDiagnosticsDialog(self).exec()
+
+    def _show_terms_dialog(self):
+        """Mostra o Termo de Uso e Privacidade (somente leitura)."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Termo de uso e privacidade")
+        dlg.setMinimumSize(680, 600)
+        v = QtWidgets.QVBoxLayout(dlg)
+        br = QtWidgets.QTextBrowser(); br.setOpenExternalLinks(True)
+        txt = _load_terms_text()
+        try: br.setMarkdown(txt)
+        except Exception: br.setPlainText(txt)
+        v.addWidget(br, 1)
+        if getattr(self.config, "terms_accepted", False):
+            v.addWidget(QtWidgets.QLabel(
+                f"<i>Aceito (versão {self.config.terms_version or '?'}) em "
+                f"{self.config.terms_accepted_at or '?'} — registro local.</i>"))
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(dlg.reject); bb.accepted.connect(dlg.accept)
+        v.addWidget(bb)
+        try: dlg.setStyleSheet(build_stylesheet(COLORS))
+        except Exception: pass
+        dlg.exec()
+
+    def _check_updates_manual(self):
+        """Verificação MANUAL e opcional de atualização. Privacidade: só BAIXA
+        código do GitHub, NUNCA envia dados. Offline -> mensagem amigável."""
+        import json as _json, ssl as _ssl, hashlib as _hashlib, shutil as _shutil
+        import urllib.request as _ur
+        cfg_path = os.path.join(SCRIPT_DIR, "update_config.json")
+        py_path  = os.path.join(SCRIPT_DIR, "EEG_Data_Collector.py")
+        cfg = {}
+        try:
+            if os.path.exists(cfg_path):
+                with open(cfg_path, encoding="utf-8") as f: cfg = _json.load(f)
+        except Exception:
+            cfg = {}
+        url = (cfg or {}).get("version_url", "")
+        if not url or "SEU_USUARIO" in url:
+            QtWidgets.QMessageBox.information(self, "Atualizações",
+                "A atualização automática não está configurada nesta instalação.\n\n"
+                "Este software funciona offline e não envia nenhum dado. "
+                f"O código-fonte está disponível em:\n{CODE_URL}")
+            return
+
+        def _vt(v):
+            try: return tuple(int(x) for x in str(v).split("."))
+            except Exception: return (0,)
+
+        def _get(u, t):
+            ctx = _ssl.create_default_context()
+            req = _ur.Request(u, headers={"User-Agent": "EEG-Collector-Updater"})
+            with _ur.urlopen(req, timeout=t, context=ctx) as r:
+                return r.read()
+
+        try:
+            manifest = _json.loads(_get(url, 6).decode("utf-8"))
+        except Exception as exc:
+            logging.getLogger("eeg").info("verificação manual de update falhou: %s", exc)
+            QtWidgets.QMessageBox.information(self, "Atualizações",
+                "Não foi possível verificar atualizações agora.\n\n"
+                "Você pode estar offline — o que é normal: o programa funciona "
+                "100% offline. Tente novamente quando tiver internet.")
+            return
+        if _vt(manifest.get("version", "0")) <= _vt(APP_VERSION):
+            QtWidgets.QMessageBox.information(self, "Atualizações",
+                f"Você já está na versão mais recente ({APP_VERSION}).")
+            return
+        novo = manifest.get("version", "?")
+        changelog = (manifest.get("changelog") or "").strip()
+        if QtWidgets.QMessageBox.question(self, "Atualização disponível",
+                f"Nova versão {novo} disponível (você tem {APP_VERSION}).\n\n"
+                f"{changelog}\n\nBaixar e aplicar agora? Apenas o código é "
+                "baixado; nenhum dado seu é enviado.") \
+                != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            blob = _get(manifest["py_url"], 60)
+            expected = (manifest.get("sha256") or "").lower().strip()
+            got = _hashlib.sha256(blob).hexdigest().lower()
+            if expected and got != expected:
+                raise ValueError("SHA-256 não confere (download corrompido/alterado).")
+            tmp = py_path + ".new"
+            with open(tmp, "wb") as f: f.write(blob)
+            try: _shutil.copyfile(py_path, py_path + ".bak")
+            except Exception: pass
+            os.replace(tmp, py_path)                 # troca atômica
+        except Exception as exc:
+            self._notify_error("E401" if "SHA-256" in str(exc) else "E403",
+                               str(exc), exc=exc)
+            return
+        QtWidgets.QMessageBox.information(self, "Atualização aplicada",
+            f"Atualizado para a versão {novo}.\n\n"
+            "Feche e abra o aplicativo para usar a nova versão.")
 
     def _update_status_state(self, text=None):
         """Atualiza a barra de status do rodapé com o estado atual."""
@@ -11740,8 +13197,9 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
 
         # Slot 0: top-left | Slot 1: top-right | Slot 2: bottom-left | Slot 3: bottom-right
         for idx in range(4):
-            kind = cfg[idx].get("kind", "empty") if idx < len(cfg) else "empty"
-            ch   = cfg[idx].get("channel", 0) if idx < len(cfg) else 0
+            item = cfg[idx] if (idx < len(cfg) and isinstance(cfg[idx], dict)) else {}
+            kind = item.get("kind", "empty")
+            ch   = item.get("channel", 0)
             slot = self._create_layout_slot(idx, kind, ch)
             target = self.left_col_split if (idx % 2 == 0) else self.right_col_split
             target.addWidget(slot["frame"])
@@ -12448,7 +13906,7 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
 
     def _load_session_csv(self, csv_path):
         """Carrega CSV de sessão. Auto-detecta formato:
-        - 'native': formato do EEG Data Collector (cols *_uV, marker)
+        - 'native': formato do OpenBiônica (cols *_uV, marker)
         - 'bci_protocol': formato do Data acquisition system.py (Time:125Hz,
            Epoch, <15 canais>, <4 Aux>, Event Id, ..., Class Id, ...)
         Retorna dict {sr, eeg (n_ch, n_samp) µV, ch_names, markers, format,
@@ -12474,10 +13932,31 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         return self._load_native_session_csv(csv_path, header)
 
     def _load_native_session_csv(self, csv_path, header):
-        """Loader para o formato nativo do EEG Data Collector."""
+        """Loader para o formato nativo do OpenBiônica."""
         ch_cols = [i for i, h in enumerate(header) if h.endswith("_uV")]
         ch_names = [header[i].replace("_uV", "") for i in ch_cols]
         marker_col = header.index("marker") if "marker" in header else None
+        # Defesa: CSVs antigos podem ter header mais largo que as linhas de dados
+        # (sessao gravada com num_channels custom > largura real do stream).
+        # Mantem apenas colunas que existem de fato na 1a linha -> nao quebra o load.
+        try:
+            with open(csv_path, "r", encoding="utf-8") as _f:
+                next(_f)
+                n_fields = len(next(_f).rstrip("\n").split(","))
+            if any(i >= n_fields for i in ch_cols):
+                keep = [k for k, i in enumerate(ch_cols) if i < n_fields]
+                logging.getLogger("eeg").warning(
+                    "CSV %s: header com %d canais mas linhas com %d campos; "
+                    "carregando %d canais validos.",
+                    os.path.basename(csv_path), len(ch_cols), n_fields, len(keep))
+                ch_names = [ch_names[k] for k in keep]
+                ch_cols  = [ch_cols[k]  for k in keep]
+            if marker_col is not None and marker_col >= n_fields:
+                marker_col = None
+        except StopIteration:
+            pass
+        except Exception:
+            pass
         data = np.loadtxt(csv_path, delimiter=",", skiprows=1,
                           usecols=ch_cols, encoding="utf-8")
         if data.ndim == 1:
@@ -12788,9 +14267,14 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
         d = self._load_session_csv(csv_path)
         if not d: return
         out_path = os.path.join(sess_dir, "data.edf")
+        w = None
         try:
             import pyedflib  # lazy
-            n_ch = d["eeg"].shape[0]
+            eeg = np.asarray(d["eeg"], dtype=float)
+            # Saneia valores nao-finitos (NaN/Inf) — senao o EDF sai corrompido
+            if not np.all(np.isfinite(eeg)):
+                eeg = np.nan_to_num(eeg, nan=0.0, posinf=0.0, neginf=0.0)
+            n_ch = eeg.shape[0]
             w = pyedflib.EdfWriter(out_path, n_ch,
                                     file_type=pyedflib.FILETYPE_EDFPLUS)
             ch_info = []
@@ -12799,24 +14283,39 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
                     "label":        d["ch_names"][i],
                     "dimension":    "uV",
                     "sample_frequency": int(round(d["sr"])),
-                    "physical_max": float(np.max(d["eeg"][i]) + 1.0),
-                    "physical_min": float(np.min(d["eeg"][i]) - 1.0),
+                    "physical_max": float(np.max(eeg[i]) + 1.0),
+                    "physical_min": float(np.min(eeg[i]) - 1.0),
                     "digital_max":  32767,
                     "digital_min": -32768,
                     "transducer":   "EEG electrode",
                     "prefilter":    "",
                 })
             w.setSignalHeaders(ch_info)
+            # Proveniência (reprodutibilidade): carimba a versão do app no EDF+
+            try:
+                w.setEquipment(f"{APP_NAME_ASCII} v{APP_VERSION}")  # EDF: ASCII
+                w.setRecordingAdditional(CODE_URL[:80])
+            except Exception:
+                pass
             for t, label in d["markers"]:
                 w.writeAnnotation(float(t), -1, str(label))
-            w.writeSamples(list(d["eeg"]))
-            w.close()
+            w.writeSamples(list(eeg))
+            w.close(); w = None
             self._log(f"✓ EDF exportado: {out_path}")
             self._audit_event("export_edf", path=out_path, channels=n_ch)
             QtWidgets.QMessageBox.information(self, "EDF exportado",
                                               f"Arquivo salvo:\n{out_path}")
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Falha EDF", str(exc))
+            # Fecha o handle ANTES de remover o arquivo / abrir o dialog, senao o
+            # .edf parcial fica travado no Windows (WinError 32).
+            if w is not None:
+                try: w.close()
+                except Exception: pass
+                w = None
+            try: os.remove(out_path)        # nao deixa .edf parcial/invalido
+            except OSError: pass
+            logging.getLogger("eeg").exception("Falha exportando EDF")
+            self._notify_error("E115", str(exc), exc=exc)
 
     def _export_to_fif(self):
         if not HAS_MNE: return
@@ -12833,6 +14332,10 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
                 ch_types=["eeg"] * len(d["ch_names"]),
             )
             raw = mne.io.RawArray(data_V, info, verbose=False)
+            try:
+                raw.info["description"] = f"{APP_NAME} v{APP_VERSION} | {CODE_URL}"
+            except Exception:
+                pass
             if d["markers"]:
                 onsets = [t for t, _ in d["markers"]]
                 durs   = [0.0] * len(onsets)
@@ -12859,13 +14362,13 @@ class EEGCollectorWindow(QtWidgets.QMainWindow):
                 "Execute: <code>python analyze_mne.py</code>"
             )
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Falha FIF", str(exc))
+            self._notify_error("E116", str(exc), exc=exc)
 
     @staticmethod
     def _write_mne_analysis_script(out_py, fif_name, ch_names, sr):
         """Gera um script Python pronto para análise EEGLAB-class com MNE."""
         content = f'''"""
-Análise EEG com MNE-Python — gerado automaticamente pelo EEG Data Collector.
+Análise EEG com MNE-Python — gerado automaticamente pelo OpenBiônica.
 
 Arquivo FIF: {fif_name}
 Canais: {len(ch_names)}  ({", ".join(ch_names[:8])}{", ..." if len(ch_names) > 8 else ""})
@@ -13028,8 +14531,8 @@ print("Análise completa.")
                 },
                 "EEGChannelCount":        len(d.get("ch_names", [])),
                 "EEGGround":              "n/a",
-                "Manufacturer":           "Bionica Lab / UFES",
-                "ManufacturersModelName": "EEG Data Collector v" + APP_VERSION,
+                "Manufacturer":           "OpenBionica",
+                "ManufacturersModelName": APP_NAME_ASCII + " v" + APP_VERSION,
                 "RecordingDuration":      float(d.get("duration", 0.0)),
                 "RecordingType":          "continuous",
             }
@@ -13053,11 +14556,12 @@ print("Análise completa.")
             if not os.path.exists(ds_desc):
                 with open(ds_desc, "w", encoding="utf-8") as f:
                     json.dump({
-                        "Name":           "EEG Data Collector dataset",
+                        "Name":           f"{APP_NAME_ASCII} dataset",
                         "BIDSVersion":    "1.8.0",
                         "DatasetType":    "raw",
                         "Authors":        [APP_AUTHORS],
-                        "GeneratedBy":    [{"Name": APP_NAME, "Version": APP_VERSION}],
+                        "GeneratedBy":    [{"Name": APP_NAME_ASCII, "Version": APP_VERSION,
+                                            "CodeURL": CODE_URL}],
                     }, f, ensure_ascii=False, indent=2)
 
             # 6) participants.tsv (anexa se não existir)
@@ -13088,7 +14592,7 @@ print("Análise completa.")
                 "Pronto para uso com EEGLAB / MNE-BIDS / Brainstorm / FieldTrip."
             )
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Falha BIDS", str(exc))
+            self._notify_error("E117", str(exc), exc=exc)
 
     def _export_pdf_report(self):
         if not (HAS_REPORTLAB and HAS_MPL): return
@@ -13104,7 +14608,7 @@ print("Análise completa.")
             QtWidgets.QMessageBox.information(self, "PDF gerado",
                                               f"Arquivo salvo:\n{out_path}")
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Falha PDF", str(exc))
+            self._notify_error("E118", str(exc), exc=exc)
 
     def _generate_pdf_report(self, d, sess_dir, out_path):
         """PDF de uma página com 3 figuras (timeseries, FFT, banda × canal)."""
@@ -13169,6 +14673,31 @@ print("Análise completa.")
         bands_path = os.path.join(tmp_dir, "bands.png")
         fig.tight_layout(); fig.savefig(bands_path, dpi=110); plt.close(fig)
 
+        # ---- Avaliação de qualidade (QC) por canal -> veredito ----
+        qc_ok = qc_noisy = qc_bad = 0
+        for i in range(n_ch):
+            x = eeg[i]
+            rms = float(np.sqrt(np.mean(x * x)))
+            pp = float(np.max(x) - np.min(x))
+            try:
+                fq, psd = scipy_signal.welch(x, fs=sr, nperseg=min(256, n_samp))
+                lr = float(np.sum(psd[(fq >= 55) & (fq <= 65)])) / max(
+                    float(np.sum(psd[(fq >= 1) & (fq <= 80)])), 1e-12)
+            except Exception:
+                lr = 0.0
+            if pp > 2000 or rms > 500 or rms < 0.5:
+                qc_bad += 1
+            elif lr > 0.40 or rms > 150:
+                qc_noisy += 1
+            else:
+                qc_ok += 1
+        if qc_bad == 0 and qc_noisy <= max(1, n_ch // 4):
+            qc_verdict, qc_color = "APTO", (0.11, 0.62, 0.46)
+        elif qc_bad <= max(1, n_ch // 4):
+            qc_verdict, qc_color = "DUVIDOSO", (0.84, 0.54, 0.0)
+        else:
+            qc_verdict, qc_color = "DESCARTAR", (0.83, 0.21, 0.31)
+
         c = rl_canvas.Canvas(out_path, pagesize=A4)
         W, H = A4
         c.setFont("Helvetica-Bold", 16)
@@ -13180,6 +14709,13 @@ print("Análise completa.")
                      f"Sujeito: {self.config.subject}  |  Canais: {n_ch}  |  "
                      f"Fs: {sr:.1f} Hz  |  Duracao: {n_samp/sr:.1f} s  |  "
                      f"Marcadores: {len(d['markers'])}")
+        # Veredito de qualidade (QC)
+        c.setFillColorRGB(*qc_color)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(2 * cm, H - 3.9 * cm,
+                     f"Qualidade do sinal: {qc_verdict}  "
+                     f"({qc_ok} OK, {qc_noisy} ruidosos, {qc_bad} ruins de {n_ch} canais)")
+        c.setFillColorRGB(0, 0, 0)
         c.drawImage(ts_path,    2*cm, H - 12*cm, width=17*cm, height=8*cm,
                     preserveAspectRatio=True, anchor="c")
         c.drawImage(fft_path,   2*cm, H - 19*cm, width=8.5*cm, height=6*cm,
@@ -13188,7 +14724,8 @@ print("Análise completa.")
                     preserveAspectRatio=True, anchor="c")
         c.setFont("Helvetica-Oblique", 8)
         c.drawString(2 * cm, 1 * cm,
-                     "EEG Data Collector - Lime Edition / Bionica Lab / UFES")
+                     f"Gerado por {APP_NAME} v{APP_VERSION} / {APP_AUTHORS} "
+                     f"- {CODE_URL}")
         c.save()
         try:
             import shutil
@@ -13791,52 +15328,63 @@ print("Análise completa.")
 
     # ---- Logo UFES adaptado ao tema ----
     def _refresh_ufes_logo_pixmap(self):
-        """Reprocessa o logo UFES para se adaptar ao tema (fundo + inversão)."""
+        """Exibe o logo UFES de modo que ACOMPANHE o fundo do header.
+
+        O brasão é circular e o PNG vem com os CANTOS pretos. Aqui o fundo
+        preto conectado às bordas vira transparente (uma única vez, em cache),
+        preservando o miolo (textos/contornos pretos cercados pelo anel
+        branco). Só redimensiona — sem inversão/recoloração por tema."""
         if not getattr(self, "ufes_logo_lbl", None):
             return
         if not os.path.exists(LOGO_UFES_PATH):
             return
-        target_h = 40
-        img = QtGui.QImage(LOGO_UFES_PATH)
-        if img.isNull():
-            return
-        img = img.convertToFormat(QtGui.QImage.Format.Format_ARGB32)
-        # Detecta luminância do fundo do header (surface)
-        bg = QtGui.QColor(COLORS.get("surface", "#222"))
-        luma = 0.299 * bg.red() + 0.587 * bg.green() + 0.114 * bg.blue()
-        is_light_bg = luma > 140
-        # Pixels escuros -> transparente; em tema claro inverte as cores.
-        # Vetorizado em numpy: antes eram DOIS laços pixel-a-pixel (transformar
-        # + reescrever byte a byte) que somavam ~0,6 s só neste logo.
-        w, h = img.width(), img.height()
-        try:
-            ptr = img.bits()
-            ptr.setsize(img.sizeInBytes())
-            stride = img.bytesPerLine()
-            arr = np.frombuffer(ptr.asstring(), dtype=np.uint8) \
-                    .reshape((h, stride // 4, 4)).copy()
-            # ARGB32 little-endian -> ordem de bytes B, G, R, A. Cópias dos
-            # canais originais (a inversão usa os valores de antes).
-            b0 = arr[..., 0].copy(); g0 = arr[..., 1].copy()
-            r0 = arr[..., 2].copy(); a0 = arr[..., 3]
-            opaque = a0 >= 8
-            black = opaque & (r0 < 35) & (g0 < 35) & (b0 < 35)
-            # Preto de fundo -> totalmente transparente
-            arr[..., 0][black] = 0; arr[..., 1][black] = 0
-            arr[..., 2][black] = 0; arr[..., 3][black] = 0
-            if is_light_bg:
-                inv = opaque & ~black
-                arr[..., 0][inv] = 255 - b0[inv]
-                arr[..., 1][inv] = 255 - g0[inv]
-                arr[..., 2][inv] = 255 - r0[inv]
-            img = QtGui.QImage(arr.tobytes(), w, h, stride,
-                               QtGui.QImage.Format.Format_ARGB32).copy()
-        except Exception:
-            # Fallback: usa pixmap original sem processamento
-            pass
-        pm = QtGui.QPixmap.fromImage(img).scaledToHeight(
-            target_h, QtCore.Qt.TransformationMode.SmoothTransformation)
+        base = getattr(self, "_ufes_base_pm", None)
+        if base is None or base.isNull():
+            pm = QtGui.QPixmap(LOGO_UFES_PATH)
+            if pm.isNull():
+                return
+            base = self._logo_clear_bg_corners(pm)
+            self._ufes_base_pm = base
+        pm = base.scaledToHeight(
+            40, QtCore.Qt.TransformationMode.SmoothTransformation)
         self.ufes_logo_lbl.setPixmap(pm)
+
+    @staticmethod
+    def _logo_clear_bg_corners(pm):
+        """Torna transparente o fundo conectado às bordas (cantos pretos do
+        brasão). Idempotente e seguro: se já houver alfa transparente, se não
+        houver fundo escuro, ou se algo falhar, devolve o pixmap original."""
+        try:
+            img = pm.toImage().convertToFormat(
+                QtGui.QImage.Format.Format_ARGB32)
+            w, h = img.width(), img.height()
+            if w < 2 or h < 2:
+                return pm
+            if img.pixelColor(0, 0).alpha() == 0:
+                return pm  # já tem fundo transparente
+            import numpy as _np
+            from scipy import ndimage as _ndi
+            arr = _np.frombuffer(
+                img.constBits(), _np.uint8).reshape(h, w, 4).copy()  # BGRA
+            soma = (arr[..., 0].astype(_np.int16)
+                    + arr[..., 1] + arr[..., 2])
+            nearblack = (soma < 120) & (arr[..., 3] > 0)
+            if not nearblack.any():
+                return pm
+            lbl, n = _ndi.label(nearblack)
+            if n == 0:
+                return pm
+            border = _np.unique(_np.concatenate(
+                [lbl[0, :], lbl[-1, :], lbl[:, 0], lbl[:, -1]]))
+            border = border[border != 0]
+            if border.size == 0:
+                return pm
+            arr[_np.isin(lbl, border), 3] = 0
+            out = QtGui.QImage(arr.tobytes(), w, h, w * 4,
+                               QtGui.QImage.Format.Format_ARGB32).copy()
+            return QtGui.QPixmap.fromImage(out)
+        except Exception:
+            return pm
 
     # ---- Handlers do tema ----
     def _on_theme_changed(self, theme_name):
@@ -13848,9 +15396,20 @@ print("Análise completa.")
         app = QtWidgets.QApplication.instance()
         if app:
             app.setStyleSheet(build_stylesheet(COLORS))
-        # pyqtgraph background
+        # pyqtgraph background — setConfigOption só afeta gráficos NOVOS, então
+        # atualizamos explicitamente TODOS os plots já criados (senão o "fundo
+        # da tela" dos gráficos não acompanha a troca de tema).
         pg.setConfigOption("background", COLORS["background"])
         pg.setConfigOption("foreground", COLORS["text"])
+        try:
+            for cls in (pg.PlotWidget, pg.GraphicsLayoutWidget, pg.ImageView):
+                for w in self.findChildren(cls):
+                    try:
+                        w.setBackground(COLORS["background"])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         # Reaplica estilos inline em widgets-chave
         self._reapply_themed_inline_styles()
         # Logo UFES (re-processa cor de fundo)
@@ -14174,6 +15733,2062 @@ print("Análise completa.")
 
 
 # ============================================================
+# Termo de Uso + Assistente de primeiro uso (setup)
+# ============================================================
+# Termo embutido (fallback) — usado se TERMO_DE_USO.md/.txt nao for encontrado
+# em disco. O texto COMPLETO fica em TERMO_DE_USO.md (ao lado do app), carregado
+# por _load_terms_text(); este resumo cobre as clausulas essenciais.
+TERMS_TEXT_FALLBACK = """\
+# Termo de Consentimento e Uso do Software — OpenBiônica
+
+Leia antes de usar. Ao prosseguir, você declara que leu, entendeu e concorda.
+Se não concordar, não utilize o software.
+
+## 1. O que é
+Software **open source** e **sem fins lucrativos** (projeto OpenBionica) para
+coleta, visualização e análise de biossinais (EEG, EMG, ECG, EoG, acelerômetro),
+destinado a **pesquisa e educação**.
+
+## 2. NÃO é dispositivo médico
+**NÃO é dispositivo médico** e **não foi certificado** por qualquer autoridade.
+**Não use para diagnóstico, tratamento ou decisão clínica.** Sinais e análises
+têm caráter exploratório/educativo e podem conter ruído e erros.
+
+## 3. Privacidade — funciona offline
+O software processa os dados **exclusivamente de forma LOCAL**, na sua máquina
+(pastas `sessions/` e `Documentos/EEG_Coletor`). **NÃO coleta, NÃO transmite,
+NÃO compartilha e NÃO "rouba" dados.** O autor **não tem acesso** a nenhum dado.
+A única função de rede é a verificação **manual e opcional** de atualização, que
+apenas **baixa código** (nunca envia dados) e pode ficar desligada — por padrão,
+o software funciona **offline**.
+
+## 4. Responsabilidade de quem usa (LGPD)
+Se você usar o software para coletar dados de terceiros (participantes), **VOCÊ é
+o controlador** desses dados (LGPD, Lei 13.709/2018) e o único responsável por
+obter o consentimento dos participantes, pela guarda/segurança/anonimização e
+pelo cumprimento legal/ético. Biossinais de pessoas identificáveis são, em regra,
+**dados sensíveis**. O autor **não é controlador nem operador** desses dados.
+
+## 5. Isenção de garantia e limitação de responsabilidade
+Software fornecido **"COMO ESTÁ"**, sem garantias de qualquer espécie. Na máxima
+extensão permitida por lei, o autor **não se responsabiliza** por danos diretos
+ou indiretos (incluindo perda de dados e decisões tomadas com base nos
+resultados). Você usa por sua conta e risco e deve manter backups.
+
+## 6. Licença
+Distribuído sob a licença **MIT** (ver arquivo LICENSE). Componentes de terceiros
+têm suas próprias licenças.
+
+## 7. Aceite
+Ao marcar "Li e concordo" e concluir, você aceita este termo. A versão do termo e
+a data do aceite ficam registradas **apenas no seu computador**.
+
+> Modelo de termo — não constitui aconselhamento jurídico. O texto completo está
+> em TERMO_DE_USO.md.
+"""
+
+
+def _load_terms_text():
+    """Carrega o termo COMPLETO de disco (ao lado do app ou em DOC_DIR);
+    cai no resumo embutido se nao encontrar."""
+    cands = [os.path.join(SCRIPT_DIR, "TERMO_DE_USO.md"),
+             os.path.join(SCRIPT_DIR, "TERMO_DE_USO.txt"),
+             os.path.join(DOC_DIR,    "TERMO_DE_USO.md")]
+    if _MEIPASS_DIR:                       # arquivos embutidos no .exe (_internal)
+        cands += [os.path.join(_MEIPASS_DIR, "TERMO_DE_USO.md"),
+                  os.path.join(_MEIPASS_DIR, "TERMO_DE_USO.txt")]
+    for p in cands:
+        try:
+            if os.path.exists(p):
+                with open(p, encoding="utf-8") as f:
+                    return f.read()
+        except Exception:
+            pass
+    return TERMS_TEXT_FALLBACK
+
+
+# Presets de layout do assistente (codigos validos de PANEL_KINDS:
+# empty, ts1, fft, bands, head, spec, accel, focus)
+WIZARD_LAYOUT_PRESETS = {
+    "Padrão (recomendado)": ["ts1", "fft", "head", "bands"],
+    "Foco EEG":             ["ts1", "fft", "spec", "bands"],
+    "EMG / Biossinais":     ["ts1", "ts1", "accel", "focus"],
+    "Minimalista":          ["ts1", "fft", "empty", "empty"],
+}
+
+
+class FirstRunWizard(QtWidgets.QDialog):
+    """Assistente de primeiro uso: idioma -> layout -> aceite do Termo de Uso.
+    Grava no AppConfig recebido e chama config.save() ao concluir. Recusar o
+    termo => reject() => o app sai no gate do main()."""
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self._chosen_layout = "Padrão (recomendado)"
+        self.setWindowTitle(f"Bem-vindo ao {APP_NAME}")
+        self.setModal(True)
+        self.setMinimumSize(680, 600)
+        root = QtWidgets.QVBoxLayout(self)
+        self.stack = QtWidgets.QStackedWidget()
+        self.stack.addWidget(self._build_page_language())  # 0
+        self.stack.addWidget(self._build_page_layout())    # 1
+        self.stack.addWidget(self._build_page_terms())     # 2
+        root.addWidget(self.stack, 1)
+        nav = QtWidgets.QHBoxLayout()
+        self.btn_decline = QtWidgets.QPushButton("Recusar e sair")
+        self.btn_back    = QtWidgets.QPushButton("Voltar")
+        self.btn_next    = QtWidgets.QPushButton("Avançar")
+        self.btn_decline.clicked.connect(self.reject)
+        self.btn_back.clicked.connect(self._go_back)
+        self.btn_next.clicked.connect(self._go_next)
+        nav.addWidget(self.btn_decline); nav.addStretch(1)
+        nav.addWidget(self.btn_back); nav.addWidget(self.btn_next)
+        root.addLayout(nav)
+        try:
+            self.setStyleSheet(build_stylesheet(COLORS))
+        except Exception:
+            pass
+        self._refresh_nav()
+
+    def _build_page_language(self):
+        w = QtWidgets.QWidget(); v = QtWidgets.QVBoxLayout(w)
+        v.addWidget(QtWidgets.QLabel("<h2>1. Idioma</h2>"))
+        v.addWidget(QtWidgets.QLabel("Escolha o idioma da interface:"))
+        self.lang_combo = QtWidgets.QComboBox()
+        for code, label in I18N.LANGUAGES.items():
+            self.lang_combo.addItem(label, code)
+        idx = self.lang_combo.findData(getattr(self.config, "language", "pt"))
+        self.lang_combo.setCurrentIndex(max(0, idx))
+        self.lang_combo.currentIndexChanged.connect(self._on_lang)
+        v.addWidget(self.lang_combo)
+        v.addWidget(QtWidgets.QLabel(
+            "<i>Alguns textos só mudam de idioma após reiniciar o programa.</i>"))
+        v.addStretch(1)
+        return w
+
+    def _on_lang(self):
+        code = self.lang_combo.currentData()
+        if code:
+            try: I18N.set_language(code)
+            except Exception: pass
+            self.config.language = code
+
+    def _build_page_layout(self):
+        w = QtWidgets.QWidget(); v = QtWidgets.QVBoxLayout(w)
+        v.addWidget(QtWidgets.QLabel("<h2>2. Layout dos painéis</h2>"))
+        v.addWidget(QtWidgets.QLabel(
+            "Organização inicial dos 4 painéis (mude depois em "
+            "Visualizar → Layout Custom):"))
+        self._layout_group = QtWidgets.QButtonGroup(self)
+        for name, kinds in WIZARD_LAYOUT_PRESETS.items():
+            rb = QtWidgets.QRadioButton(f"{name}   ({', '.join(kinds)})")
+            rb.setProperty("preset", name)
+            if name == self._chosen_layout: rb.setChecked(True)
+            rb.toggled.connect(self._on_layout)
+            self._layout_group.addButton(rb)
+            v.addWidget(rb)
+        v.addStretch(1)
+        return w
+
+    def _on_layout(self):
+        for b in self._layout_group.buttons():
+            if b.isChecked():
+                self._chosen_layout = b.property("preset")
+
+    def _build_page_terms(self):
+        w = QtWidgets.QWidget(); v = QtWidgets.QVBoxLayout(w)
+        v.addWidget(QtWidgets.QLabel("<h2>3. Termo de Consentimento e Uso</h2>"))
+        browser = QtWidgets.QTextBrowser()
+        browser.setOpenExternalLinks(True)
+        txt = _load_terms_text()
+        try:
+            browser.setMarkdown(txt)
+        except Exception:
+            browser.setPlainText(txt)
+        v.addWidget(browser, 1)
+        self.chk_terms = QtWidgets.QCheckBox(
+            "Li, entendi e concordo com o Termo de Consentimento e Uso do Software.")
+        self.chk_terms.toggled.connect(lambda _on: self._refresh_nav())
+        v.addWidget(self.chk_terms)
+        return w
+
+    def _go_back(self):
+        i = self.stack.currentIndex()
+        if i > 0: self.stack.setCurrentIndex(i - 1)
+        self._refresh_nav()
+
+    def _go_next(self):
+        i = self.stack.currentIndex()
+        if i < self.stack.count() - 1:
+            self.stack.setCurrentIndex(i + 1); self._refresh_nav()
+        else:
+            self.accept()
+
+    def _refresh_nav(self):
+        i = self.stack.currentIndex()
+        last = (i == self.stack.count() - 1)
+        self.btn_back.setEnabled(i > 0)
+        self.btn_next.setText("Concluir" if last else "Avançar")
+        self.btn_next.setEnabled(self.chk_terms.isChecked() if last else True)
+
+    def accept(self):
+        if not self.chk_terms.isChecked():
+            return  # trava defensiva
+        try:
+            code = self.lang_combo.currentData()
+            if code: self.config.language = code
+            self.config.layout_slots_cfg = [
+                {"kind": k, "channel": 0}
+                for k in WIZARD_LAYOUT_PRESETS.get(
+                    self._chosen_layout, ["ts1", "fft", "head", "bands"])]
+            self.config.terms_accepted    = True
+            self.config.terms_version     = TERMS_VERSION
+            self.config.terms_accepted_at = datetime.now().isoformat(timespec="seconds")
+            self.config.first_run_done    = True
+            self.config.save()
+        except Exception:
+            logging.getLogger("eeg").exception("Falha salvando aceite do termo")
+        super().accept()
+
+
+# ============================================================
+# Catalogo de erros + notificacao com codigo (Erro E0XX)  [gerado]
+# ============================================================
+# Cada entrada: codigo -> (titulo, mensagem amigavel, bloqueante?)
+ERROR_CATALOG = {
+    'E001': ('Falha ao abrir porta COM', 'Não foi possível abrir a porta selecionada. Verifique se o dispositivo está ligado, se a porta está correta e se nenhum outro programa (OpenBCI GUI, Arduino IDE) a está usando.', True),
+    'E002': ('Nenhuma porta COM selecionada', 'Nenhuma porta COM selecionada. Conecte a placa por USB e clique em Atualizar para listar as portas.', False),
+    'E003': ('Baud rate inválido', 'Baud rate inválido. Escolha um valor numérico (ex.: 115200).', False),
+    'E004': ('Conectado mas sem dados (watchdog)', 'Conectado a a porta selecionada, mas nenhum dado chegou em algunss. Verifique o firmware da placa, o baud rate e o cabo. Tente reconectar.', True),
+    'E005': ('Perda de conexão durante aquisição', 'A conexão com a porta selecionada foi perdida durante a aquisição (dispositivo removido?). Reconecte o cabo e clique em Conectar novamente.', True),
+    'E006': ('Pacotes corrompidos / dessincronização', 'Muitos pacotes corrompidos recebidos de a porta selecionada. Verifique o baud rate e a qualidade do cabo USB; os dados podem estar incompletos.', False),
+    'E007': ('Comando de expansão não enviado', 'Não foi possível enviar o comando de expansão à placa. Reconecte e tente novamente; a contagem de canais pode estar inconsistente.', False),
+    'E008': ('Início de streaming sem resposta', 'A placa abriu mas não respondeu ao comando de início de streaming. Verifique o firmware/baud e reconecte.', False),
+    'E009': ('Daisy 16ch sem emparelhar', 'Em modo 16 canais, os pacotes da placa não estão emparelhando. A qualidade/contagem de canais pode estar incorreta — verifique se a Daisy está conectada.', False),
+    'E010': ('CSV de playback não encontrado', 'Arquivo CSV de playback não encontrado. Selecione um arquivo válido em modo Playback.', True),
+    'E011': ('CSV de playback malformado', 'Não foi possível ler o CSV de playback (formato inválido ou corrompido). Use um CSV gerado por este programa.', True),
+    'E012': ('Nº de canais do playback adivinhado', 'Não identifiquei com certeza o número de canais do CSV; assumindo alguns. Confira o seletor de canais.', False),
+    'E013': ('Biblioteca bleak ausente (BLE)', "Biblioteca 'bleak' não instalada. Instale com pip install bleak para escanear dispositivos BLE.", False),
+    'E014': ('Falha no scan Bluetooth', 'Falha ao escanear Bluetooth. Verifique se o Bluetooth do Windows está ligado e se o app tem permissão.', False),
+    'E015': ('Falha ao iniciar outlet LSL', 'Não foi possível iniciar o streaming LSL. Verifique se pylsl/liblsl está instalada corretamente.', False),
+    'E016': ('Envio LSL falhando continuamente', 'O envio de dados via LSL está falhando — o streaming externo pode ter parado. Reinicie o LSL.', False),
+    'E017': ('Autostart da simulação falhou', "Não foi possível iniciar a simulação automaticamente. Vá em Configurar → Conexão, selecione 'Simulação' e clique em Conectar.", False),
+    'E018': ('Configuração do launcher não aplicada', 'Parte das configurações iniciais não pôde ser aplicada. Revise porta, canais e voluntário antes de iniciar a coleta.', False),
+    'E019': ('Thread não encerrou no timeout', 'A conexão anterior demorou a encerrar. Se a próxima conexão falhar, feche e reabra o programa.', False),
+    'E020': ('Exceção interna na simulação', 'Falha interna na simulação. Desconecte e tente novamente.', False),
+    'E100': ('Gravação parou de salvar em disco', 'A gravação parou de salvar (disco cheio ou unidade removida). Os dados a partir de agora estão sendo PERDIDOS. Pare a gravação, libere espaço e reinicie a coleta.', True),
+    'E101': ('Referência de tempo da sessão ausente', 'Referência de tempo da sessão não inicializada; timestamps inválidos. Reconecte o dispositivo antes de gravar.', False),
+    'E102': ('Filtro em tempo real falhou (gravação crua)', 'O filtro digital falhou em alguns amostras; elas foram gravadas sem filtragem. A sessão será marcada como degradada — confira os parâmetros de filtro.', False),
+    'E103': ('events.csv não pôde ser criado', 'Não foi possível criar events.csv; os marcadores não serão mapeados às amostras. A gravação continua, mas a análise por eventos ficará limitada.', False),
+    'E104': ('Marcador não gravado em events.csv', 'Falha ao registrar um marcador em events.csv. Verifique o espaço em disco; alguns marcadores podem não constar no arquivo.', False),
+    'E105': ('Trilha de auditoria não gravada', 'Não foi possível registrar a trilha de auditoria (events.jsonl). A coleta continua, mas o histórico de ações pode ficar incompleto.', False),
+    'E106': ('Pasta da sessão não pôde ser criada', 'Não foi possível criar a pasta da sessão em o caminho informado (permissão ou disco). Escolha outra pasta de salvamento e tente novamente.', True),
+    'E107': ('Arquivos da sessão (data.csv/log) não criados', 'Não foi possível criar o arquivo de dados da sessão. A gravação não iniciou. Verifique permissões e espaço em disco.', True),
+    'E108': ('Disco insuficiente antes de gravar', 'Restam apenas poucos MB livres em a unidade. Uma sessão longa pode encher o disco e perder dados. Libere espaço antes de gravar.', False),
+    'E109': ('summary.json não gravado', 'Não foi possível gravar summary.json; a sessão ficará sem metadados (canais/filtros/voluntário). A gravação continua.', False),
+    'E110': ('Ficha do voluntário não anexada', 'Não foi possível anexar a ficha do voluntário à sessão. Os dados do participante podem não constar nesta pasta.', False),
+    'E111': ('Assinatura de integridade (SHA-256) falhou', 'Não foi possível gerar a assinatura de integridade desta sessão. O arquivo foi salvo, mas sem prova anti-adulteração.', False),
+    'E112': ('Histórico do voluntário não atualizado', 'A sessão foi salva, mas não foi possível atualizar o histórico do voluntário. Verifique a ficha do participante.', False),
+    'E113': ('Falha ao finalizar/fechar arquivos', 'Houve um problema ao finalizar os arquivos da sessão. Verifique se data.csv não está aberto em outro programa antes de exportar.', False),
+    'E114': ('Snapshot PNG não salvo', 'Não foi possível salvar um ou mais snapshots (disco/recurso gráfico). A coleta continua; verifique a pasta snapshots/.', False),
+    'E115': ('Falha ao exportar EDF', 'Falha ao exportar EDF. Verifique se data.edf não está aberto em outro programa e tente de novo.', True),
+    'E116': ('Falha ao exportar FIF', 'Falha ao exportar FIF. Verifique se o arquivo não está aberto/bloqueado e tente novamente.', True),
+    'E117': ('Falha ao gerar estrutura BIDS', 'Falha ao gerar a estrutura BIDS. A pasta pode ter ficado incompleta; verifique permissões da pasta raiz e refaça a exportação.', True),
+    'E118': ('Falha ao gerar relatório PDF', 'Não foi possível gerar o relatório PDF. Verifique se report.pdf não está aberto em outro programa e tente novamente.', True),
+    'E200': ('data.csv corrompido/vazio ao carregar', 'Não foi possível ler os dados deste CSV — ele pode estar corrompido, vazio ou conter texto onde deveria haver números. Reexporte a sessão ou escolha outro arquivo.', True),
+    'E201': ('CSV sem colunas de canal (*_uV)', "Este arquivo não tem colunas de canal reconhecíveis (ex.: 'Ch1_uV'). Confirme que é um CSV de sessão gravado pelo programa.", True),
+    'E202': ('Marcadores/eventos não extraídos do CSV', 'Não foi possível extrair os marcadores/eventos do CSV. As análises baseadas em eventos ficarão indisponíveis para esta sessão.', False),
+    'E203': ('Taxa de amostragem assumida (timestamps inválidos)', 'Não foi possível medir a taxa de amostragem; assumindo Hz. As análises de tempo/frequência podem ficar incorretas se a taxa real for outra.', False),
+    'E204': ('SR medida diverge da declarada (>5%)', 'A taxa de amostragem medida difere >5% da declarada. As frequências/bandas podem estar incorretas; verifique a configuração de SR da gravação.', False),
+    'E205': ('Amostra insuficiente para estatística (n<2)', 'Pelo menos um grupo tem menos de 2 sessões — sem dados suficientes para um teste estatístico. Adicione mais sessões.', False),
+    'E206': ('Pareamento com grupos de tamanhos diferentes', "Você marcou 'amostras pareadas', mas os grupos têm tamanhos diferentes (×). Foram pareadas apenas as primeiras — confirme a correspondência ou desmarque 'pareado'.", False),
+    'E207': ('Teste estatístico não pôde ser calculado', 'O teste estatístico não pôde ser calculado para esta banda (ex.: dados constantes ou variância nula). Resultado omitido.', False),
+    'E208': ('Falha ao salvar relatório de estatística', "Não consegui salvar o relatório em 'o caminho informado'. Verifique espaço em disco e permissão de escrita (pastas do OneDrive em sincronização podem bloquear).", True),
+    'E209': ('Treino do classificador BCI falhou', 'O treino do classificador falhou — costuma ocorrer quando os canais são muito parecidos, há poucos dados ou o sinal tem valores inválidos. Recolha mais trials ou troque os canais. (detalhe: )', True),
+    'E210': ('Trial BCI capturado sem filtro (banda inválida)', 'A banda de filtragem (- Hz) é inválida (deve ser 0 < baixa < alta < Hz). O trial foi capturado sem filtro — corrija a banda antes de treinar.', False),
+    'E211': ('ERD/ERS todo zerado (janelas curtas/baseline nula)', 'As janelas MI/baseline são curtas demais ou a potência de repouso é ~zero — o ERD pode estar zerado e não confiável. Use trials mais longos e verifique o contato dos eletrodos.', False),
+    'E212': ('ERD% indefinido — segmentos descartados', 'Alguns segmentos foram ignorados (potência de repouso ~zero ou evento curto demais). Verifique se há sinal válido no canal/baseline escolhidos.', False),
+    'E213': ('Classificação online BCI falhando', 'A classificação online está falhando repetidamente (sinal ausente ou filtro inválido). Verifique a conexão e a banda.', False),
+    'E214': ('Métricas de tempo real não calculáveis (Foco/EMG/ECG/EoG)', 'Não foi possível calcular as métricas de (sinal insuficiente/inválido no canal selecionado). Verifique o canal e o filtro.', False),
+    'E300': ('config.json corrompido (reset silencioso)', 'Não foi possível ler suas configurações (config.json corrompido). Voltamos ao padrão. Há uma cópia em config.json.bak — deseja restaurá-la?', False),
+    'E301': ('Falha ao salvar config.json', 'Não foi possível salvar suas configurações. Verifique espaço em disco e se a pasta não está bloqueada (OneDrive/antivírus). Suas mudanças podem se perder ao fechar.', True),
+    'E302': ('Pasta de salvamento padrão não criável', 'Não foi possível criar a pasta de gravação (o caminho informado). Escolha outra pasta com permissão de escrita em Configurações → Caminhos.', True),
+    'E303': ('Troca de pasta de salvamento falhou', 'Não foi possível usar a pasta o caminho informado (sem permissão ou caminho inacessível). A pasta de salvamento continua a anterior. Escolha outra.', True),
+    'E304': ('Tema salvo inexistente (fallback)', 'O tema salvo (o recurso) não foi encontrado — aplicamos o padrão. Reselecione ou recrie seu tema em Configurações → Tema.', False),
+    'E305': ('Layout salvo com painel inexistente', 'Um ou mais painéis do seu layout salvo não existem nesta versão e foram substituídos pelo padrão. Reorganize em Visualizar → Layout Custom.', False),
+    'E306': ('Salvar layout/tema reportou sucesso falso', 'A configuração foi aplicada, mas não pôde ser salva para as próximas sessões (veja o aviso sobre config.json).', False),
+    'E307': ('Aceite do Termo de Uso não persistido', 'Você aceitou o termo, mas não foi possível registrar o aceite em disco. O assistente vai reaparecer na próxima abertura. Verifique espaço/permissões.', True),
+    'E308': ('Termo de Uso completo ausente (resumo exibido)', 'O texto completo do Termo de Uso não foi encontrado; exibindo a versão resumida. O documento completo está em https://github.com/rodrigooa43-create/OpenBionica.', False),
+    'E309': ('Configurações não salvas ao sair', 'Não foi possível salvar suas configurações ao sair. Verifique espaço/permissões. Deseja fechar mesmo assim?', True),
+    'E400': ('Manifesto de update inválido/incompleto', 'O servidor respondeu, mas as informações da nova versão estão incompletas/corrompidas. Tente mais tarde; sua versão atual foi mantida.', False),
+    'E401': ('SHA-256 do download não confere', 'A atualização baixada está corrompida ou adulterada e não foi aplicada. Verifique sua conexão e tente novamente; a versão atual foi preservada.', True),
+    'E402': ('Update sem assinatura SHA-256', 'Esta atualização não inclui assinatura de verificação (SHA-256). Por segurança, baixe a nova versão manualmente em https://github.com/rodrigooa43-create/OpenBionica.', True),
+    'E403': ('Falha ao gravar o arquivo atualizado', 'Não foi possível gravar a atualização (sem permissão na pasta do programa, ou o app está aberto em outra janela). Feche outras cópias / rode como administrador, ou baixe manualmente em https://github.com/rodrigooa43-create/OpenBionica.', True),
+    'E404': ('update_config.json corrompido', 'O arquivo de configuração de atualização está corrompido. A verificação foi desativada; baixe atualizações manualmente em https://github.com/rodrigooa43-create/OpenBionica.', False),
+    'E500': ('Exportação EDF indisponível (pyedflib ausente)', 'Exportação EDF indisponível: a biblioteca pyedflib não está instalada. Instale com pip install pyedflib ou use outro formato (FIF/BIDS).', True),
+    'E501': ('Exportação FIF indisponível (MNE ausente)', 'Exportação FIF indisponível: a biblioteca MNE não está instalada (pip install mne). Use EDF/BIDS como alternativa.', True),
+    'E502': ('Relatório PDF indisponível (reportlab/matplotlib)', 'Geração de PDF indisponível: faltam reportlab e/ou matplotlib (pip install reportlab matplotlib).', True),
+    'E503': ('Dependência instalada mas não carrega (DLL/ABI)', 'O recurso o recurso está instalado mas não pôde ser carregado (instalação corrompida ou incompatível). Reinstale com pip install --force-reinstall o pacote.', True),
+    'E600': ('Diretório de log não pôde ser criado', 'Não foi possível criar o arquivo de log em Documentos\\EEG_Coletor\\logs. Os relatórios de erro não serão salvos em disco. Verifique permissões/espaço.', False),
+    'E601': ('Captura de tela falhou', 'Não foi possível salvar a captura de tela. Verifique espaço em disco e permissão na pasta de sessões.', False),
+    'E602': ('Ação de atalho (hotkey) falhou', 'Não foi possível executar a ação do atalho.', False),
+    'E603': ('Abrir pasta/caminho falhou', "Não foi possível abrir 'o item'. Confirme que o caminho existe e está acessível.", False),
+    'E604': ('Logos/ícones ausentes', 'Arquivos de logo/ícone não encontrados — a interface segue funcional sem eles. Coloque os arquivos ao lado do aplicativo se quiser exibi-los.', False),
+    'E999': ('Erro inesperado (excepthook)', 'Ocorreu um erro inesperado e o aplicativo pode ficar instável. Um relatório foi salvo em Documentos\\EEG_Coletor\\logs\\app.log. Reinicie o aplicativo; se persistir, envie esse arquivo ao suporte.', True),
+}
+
+
+def error_info(code):
+    """Retorna (titulo, mensagem, bloqueante) do codigo; fallback generico."""
+    return ERROR_CATALOG.get(code, ("Erro", "Ocorreu um erro nao catalogado.", True))
+
+
+def notify_error(code, detail="", parent=None, exc=None, blocking=None):
+    """Sinaliza um erro ao usuario como 'Erro {codigo}': loga SEMPRE e mostra
+    um dialogo (bloqueante) ou deixa para a barra de status (aviso). Seguro fora
+    da GUI (cai para print)."""
+    title, msg, blk = error_info(code)
+    if blocking is None:
+        blocking = blk
+    try:
+        logging.getLogger("eeg").error(
+            "[%s] %s%s", code, title, (" | " + str(detail)) if detail else "",
+            exc_info=(exc is not None))
+    except Exception:
+        pass
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        print(f"[Erro {code}] {title}: {detail}")
+        return
+    body = msg + (f"\n\nDetalhe técnico: {detail}" if detail else "")
+    box = QtWidgets.QMessageBox(parent)
+    box.setIcon(QtWidgets.QMessageBox.Icon.Critical if blocking
+                else QtWidgets.QMessageBox.Icon.Warning)
+    box.setWindowTitle(f"Erro {code}")
+    box.setText(f"<b>Erro {code} \u2014 {title}</b>")
+    box.setInformativeText(body)
+    if exc is not None:
+        try:
+            box.setDetailedText("".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)))
+        except Exception:
+            pass
+    box.exec()
+
+
+class ErrorDiagnosticsDialog(QtWidgets.QDialog):
+    """Lista o catalogo de erros e permite SIMULAR cada notificacao (Erro E0XX),
+    para o usuario conhecer/testar as mensagens que o programa pode exibir."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Diagnóstico de erros — simular notificações")
+        self.setMinimumSize(780, 580)
+        v = QtWidgets.QVBoxLayout(self)
+        v.addWidget(QtWidgets.QLabel(
+            "<b>Catálogo de erros do programa.</b> Selecione um código e clique em "
+            "<b>Simular</b> para ver a notificação. No uso real, <i>avisos</i> "
+            "aparecem na barra de status (rodapé) e <i>bloqueantes</i> abrem um "
+            "diálogo; aqui mostramos o diálogo para você conhecer cada um."))
+        self.filter_edit = QtWidgets.QLineEdit()
+        self.filter_edit.setPlaceholderText("Filtrar por código ou texto…")
+        self.filter_edit.textChanged.connect(self._refilter)
+        v.addWidget(self.filter_edit)
+        self.table = QtWidgets.QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Código", "Tipo", "Título"])
+        self.table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        v.addWidget(self.table, 1)
+        self._rows = sorted(ERROR_CATALOG.items())
+        self._fill(self._rows)
+        self.table.itemSelectionChanged.connect(self._preview)
+        self.table.doubleClicked.connect(self._simulate)
+        self.preview = QtWidgets.QPlainTextEdit(); self.preview.setReadOnly(True)
+        self.preview.setMaximumHeight(120)
+        v.addWidget(self.preview)
+        h = QtWidgets.QHBoxLayout()
+        self.count_lbl = QtWidgets.QLabel(f"{len(self._rows)} códigos catalogados")
+        btn_sim = QtWidgets.QPushButton("▶ Simular notificação")
+        btn_sim.clicked.connect(self._simulate)
+        btn_close = QtWidgets.QPushButton("Fechar"); btn_close.clicked.connect(self.accept)
+        h.addWidget(self.count_lbl); h.addStretch(1)
+        h.addWidget(btn_sim); h.addWidget(btn_close)
+        v.addLayout(h)
+        try: self.setStyleSheet(build_stylesheet(COLORS))
+        except Exception: pass
+        if self.table.rowCount(): self.table.selectRow(0)
+
+    def _fill(self, rows):
+        self.table.setRowCount(len(rows))
+        for r, (code, (title, _msg, blk)) in enumerate(rows):
+            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(code))
+            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(
+                "Bloqueante" if blk else "Aviso"))
+            self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(title))
+        self.table.resizeColumnToContents(0)
+        self.table.resizeColumnToContents(1)
+
+    def _refilter(self, text):
+        t = (text or "").lower().strip()
+        rows = [it for it in self._rows if (t in it[0].lower()
+                or t in it[1][0].lower() or t in it[1][1].lower())]
+        self._fill(rows)
+        self.count_lbl.setText(f"{len(rows)} de {len(self._rows)} códigos")
+        if self.table.rowCount(): self.table.selectRow(0)
+
+    def _current_code(self):
+        r = self.table.currentRow()
+        it = self.table.item(r, 0) if r >= 0 else None
+        return it.text() if it else None
+
+    def _preview(self):
+        code = self._current_code()
+        if not code: return
+        title, msg, blk = error_info(code)
+        self.preview.setPlainText(
+            f"Erro {code} — {title}  [{'Bloqueante' if blk else 'Aviso'}]\n\n{msg}")
+
+    def _simulate(self, *_):
+        code = self._current_code()
+        if not code:
+            QtWidgets.QMessageBox.information(self, "Simular",
+                                              "Selecione um código na lista.")
+            return
+        notify_error(code, "(simulação)", parent=self, blocking=True)
+
+
+# ============================================================
+# Assistente de Ajuda (OFFLINE) — busca local em FAQ + erros + manual
+# ============================================================
+HELP_FAQ = [
+    {"t": "Conectar ao dispositivo",
+     "k": "como conectar dispositivo placa openbci cyton porta com iniciar coleta hardware",
+     "a": "Vá em <b>Configurar → Conexão</b>, escolha a <b>Porta</b> COM, o nº de canais "
+          "e o modo, e clique em <b>Conectar</b>. Sem hardware, use o <b>Modo "
+          "Simulação</b> na tela inicial.",
+     "ref": "Manual: Coleta → Conexão"},
+    {"t": "Nenhuma porta COM aparece",
+     "k": "porta com nao aparece vazia lista nao encontra dispositivo usb cabo",
+     "a": "Verifique o cabo/dongle, clique em <b>Atualizar</b> na aba Conexão e feche "
+          "outros programas que usem a porta (OpenBCI GUI, Arduino IDE). Para testar "
+          "sem hardware, use o <b>Modo Simulação</b>.",
+     "ref": "Erro E001/E002"},
+    {"t": "Calibração e impedância",
+     "k": "impedancia calibracao contato eletrodo verde vermelho qualidade sinal ruido",
+     "a": "Em <b>Configurar → Calibração</b>, rode o teste de impedância. Valores "
+          "baixos (verde) = bom contato. O indicador no topo mostra ● OK / ▲ ruidoso "
+          "/ ■ ruim por canal.",
+     "ref": "Manual: Calibração"},
+    {"t": "Filtros (notch e passa-banda)",
+     "k": "filtro notch 60 50 hz passa banda bandpass ruido rede eletrica",
+     "a": "Em <b>Configurar → Filtros e Canais</b>, ative o <b>notch</b> (60 Hz no "
+          "Brasil) e ajuste o <b>passa-banda</b> conforme a análise (ex.: 1–40 Hz "
+          "para EEG).",
+     "ref": "Manual: Filtros e canais"},
+    {"t": "Gravar uma sessão",
+     "k": "gravar sessao iniciar parar registro salvar coleta botao",
+     "a": "Conecte o dispositivo e clique em <b>Gravar</b> (ou Ctrl+R). Os dados vão "
+          "para uma pasta por sessão (data.csv, summary.json, …). Clique de novo para "
+          "parar.",
+     "ref": "Manual: Gravar uma sessão"},
+    {"t": "Onde ficam minhas gravações",
+     "k": "onde ficam gravacoes arquivos sessoes pasta salvar local csv encontrar",
+     "a": "Na subpasta <b>sessions/</b> (ou na pasta de salvamento configurada). "
+          "Atalho: <b>Ajuda → Pasta de configuração / sessões</b>.",
+     "ref": "Manual: Solução de problemas"},
+    {"t": "Marcadores de evento",
+     "k": "marcador evento marker hotkey tecla m estimulo anotar gatilho",
+     "a": "Durante a gravação, registre um marcador pela tecla de atalho (ex.: <b>M</b>) "
+          "ou pelo painel de eventos. Eles ficam em events.csv e servem à análise por "
+          "eventos.",
+     "ref": "Manual: Coleta"},
+    {"t": "Análises (FFT, bandas)",
+     "k": "analise fft espectro bandas delta teta alfa beta gama potencia frequencia",
+     "a": "Em <b>Analisar → Análises</b> você vê a FFT, a potência por banda "
+          "(δ θ α β γ) e estatísticas por canal da janela selecionada.",
+     "ref": "Manual: Análises"},
+    {"t": "Topografia e espectrograma",
+     "k": "topografia mapa calor head plot espectrograma tempo frequencia",
+     "a": "Em <b>Visualizar → Topografia</b> veja o mapa de calor (10–20); em "
+          "<b>Espectrograma</b>, a frequência ao longo do tempo.",
+     "ref": "Manual: Topografia / Espectrograma"},
+    {"t": "ERS/ERD (imagética motora)",
+     "k": "ers erd imagetica motora dessincronizacao mu beta baseline repouso",
+     "a": "Em <b>Analisar → ERS/ERD</b>, carregue a sessão, escolha a classe, a banda "
+          "(ex.: Mu 8–13 Hz) e a baseline (repouso) e clique em Computar. ERD < 0 "
+          "indica dessincronização.",
+     "ref": "Manual: ERS/ERD"},
+    {"t": "Comparar Antes × Depois (estatística)",
+     "k": "comparar grupos antes depois estatistica teste significancia p valor exo",
+     "a": "Em <b>Analisar → Offline</b>, use <b>Estatística guiada (comparar grupos)</b>: "
+          "selecione as sessões de cada grupo; o programa escolhe o teste sozinho, "
+          "monta a tabela por banda e explica o resultado.",
+     "ref": "Manual: Facilitador estatístico"},
+    {"t": "Comparar condições de uma sessão",
+     "k": "comparar condicoes sessao classes repouso metrica banda rms erd intra",
+     "a": "Em <b>Analisar → Offline</b>, use <b>Comparar condições da sessão</b>: compara "
+          "as condições que existirem (classes, tarefa × repouso) pela métrica escolhida "
+          "(banda, RMS ou ERD%).",
+     "ref": "Manual: Facilitador estatístico"},
+    {"t": "Área Maker — Receitas de análise",
+     "k": "receita area maker pipeline montar analise template reutilizar salvar json composavel",
+     "a": "Em <b>Analisar → Offline → Receitas de análise (Área Maker)</b> você monta "
+          "uma análise (métrica + banda + canais), roda em uma ou várias sessões e "
+          "<b>salva como .json</b> para reutilizar/compartilhar o protocolo.",
+     "ref": "Área Maker"},
+    {"t": "Exportar EDF / FIF / BIDS / PDF",
+     "k": "exportar edf fif bids pdf relatorio formato clinico cientifico converter salvar",
+     "a": "Em <b>Configurar → Sessão e Arquivos</b>, exporte para EDF/EDF+, FIF (MNE), "
+          "BIDS ou um relatório PDF. (FIF exige rodar via Python; no .exe use EDF/BIDS.) "
+          "Se falhar, veja os Erros E115–E118.",
+     "ref": "Manual: Exportação"},
+    {"t": "Atualizações (offline/manual)",
+     "k": "atualizar atualizacao versao nova update offline github verificar internet",
+     "a": "O programa é <b>offline por padrão</b>. Para checar, use <b>Ajuda → Verificar "
+          "atualizações</b>. Ele só baixa código (nunca envia dados) e confere a "
+          "assinatura SHA-256.",
+     "ref": "Manual: Atualizações"},
+    {"t": "Privacidade e Termo de Uso",
+     "k": "privacidade dados lgpd termo offline coleta envia compartilha seguranca",
+     "a": "O software funciona <b>offline</b> e <b>não coleta, não envia e não "
+          "compartilha</b> dados — tudo fica na sua máquina. Releia em <b>Ajuda → Termo "
+          "de uso e privacidade</b>.",
+     "ref": "Termo de Uso"},
+    {"t": "Códigos de erro (Erro E0XX)",
+     "k": "erro codigo problema falha mensagem o que significa resolver",
+     "a": "Quando algo falha, aparece um <b>código</b> (ex.: Erro E115). Digite o código "
+          "aqui para a explicação, ou abra <b>Ajuda → Diagnóstico de erros</b> para a "
+          "lista completa.",
+     "ref": "ERROS.md"},
+    {"t": "Treinador BCI",
+     "k": "bci treinador csp lda classificador imagetica treinar acuracia",
+     "a": "Em <b>Analisar → BCI Trainer</b>, treine um classificador (CSP + LDA) a partir "
+          "dos trials gravados; o programa mostra a acurácia.",
+     "ref": "Manual: Treinador BCI"},
+    {"t": "Onde fica o log de erros",
+     "k": "log arquivo erro relatorio suporte diagnostico applog problema",
+     "a": "Em <b>Documentos/EEG_Coletor/logs/app.log</b>. Anexe esse arquivo ao relatar "
+          "um problema — ajuda a diagnosticar.",
+     "ref": "Manual: Solução de problemas"},
+    {"t": "Abrir arquivo EDF / BDF",
+     "k": "abrir edf bdf importar ler arquivo edfbrowser icelera converter reparo "
+          "ascii cabecalho quebrado nao abre erro caractere",
+     "a": "Em <b>Analisar → Offline</b> clique em <b>Abrir EDF/BDF (reparo "
+          "automático)</b>. O leitor é <b>tolerante</b>: ignora cabeçalhos com "
+          "caracteres inválidos (acentos no nome do paciente) que fazem o EDFbrowser/"
+          "pyedflib recusarem o arquivo. Ele converte para CSV nativo (respeitando a "
+          "taxa de amostragem real) e já abre para análise. Também funciona ao "
+          "cadastrar um voluntário e importar o exame.",
+     "ref": "Manual: Análise offline"},
+    {"t": "Limpar artefatos (ICA)",
+     "k": "ica artefato piscada ocular eog limpar componente independente frontal "
+          "fastica mne instalar pip automatico data_clean",
+     "a": "Em <b>Analisar → Offline</b>, abra a sessão e clique em <b>Limpar "
+          "artefatos (ICA)</b>. Roda <b>FastICA em numpy puro</b> — <b>não precisa "
+          "instalar nada</b> (nem MNE). Ele filtra 1–40 Hz, detecta o componente de "
+          "piscada pelos canais frontais (Fp1/Fp2) e salva <b>data_clean.csv</b> na "
+          "pasta da sessão.",
+     "ref": "Manual: Análise offline"},
+    {"t": "Topografia CSD / Laplaciano (vs LORETA)",
+     "k": "topografia csd laplaciano superficie current source density conducao "
+          "volume loreta sloreta fonte localizacao mne eeglab mapa nitido fonte local",
+     "a": "Na aba <b>Topografia</b>, troque <b>Mapa</b> para <b>CSD / Laplaciano "
+          "(fonte)</b>: realça fontes locais e reduz a condução de volume (mapa mais "
+          "nítido que o interpolado). O botão <b>vs LORETA / MNE…</b> explica como "
+          "isso se compara à localização de fonte 3D (LORETA/sLORETA) e quando "
+          "exportar para MNE/EEGLAB.",
+     "ref": "Manual: Topografia"},
+    {"t": "Área Maker — ERD% e modelos prontos",
+     "k": "area maker receita erd baseline potencia relativa relband modelo pronto "
+          "template cenario openvibe metrica mu beta imagetica pipeline",
+     "a": "A <b>Área Maker</b> agora tem as métricas <b>ERD% vs baseline</b> "
+          "(imagética motora) e <b>potência relativa da banda (%)</b>, além de "
+          "<b>Modelos prontos</b> (ex.: 'ERD Mu — imagética motora', 'Alpha relativo') "
+          "que preenchem a receita com valores embasados. Para o ERD, defina a "
+          "<b>baseline</b> (janela de repouso) e o <b>recorte</b> (janela da tarefa).",
+     "ref": "Manual: Área Maker"},
+    {"t": "Como o Consultor pensa (metodologia)",
+     "k": "consultor assistente metodologia abordar estudo raciocinio focado "
+          "referencias literatura embasado como devo aprofundar sugestao",
+     "a": "O <b>Consultor</b> (F1) tenta entender sua <b>intenção</b> e dá uma "
+          "resposta <b>focada e com referências</b> — não despeja texto genérico. "
+          "Pergunte de metodologia (ex.: <i>como abordo EEG de membro superior?</i>, "
+          "<i>qual banda/janela para MI?</i>, <i>como evitar vazamento na validação?</i>) "
+          "e ele responde com base em literatura e sugere <b>o que fazer no programa</b> "
+          "e <b>perguntas de aprofundamento</b>. Se não souber, ele diz e orienta "
+          "contatar o suporte ou contribuir no código aberto.",
+     "ref": "Consultor OpenBionica"},
+]
+
+
+def _help_norm(s):
+    s = unicodedata.normalize("NFKD", (s or "").lower())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9 ]+", " ", s)
+
+
+_HELP_STOP = {"como", "fazer", "faco", "faz", "quero", "qual", "quais", "onde",
+              "meu", "minha", "meus", "minhas", "para", "por", "que", "isso",
+              "esse", "essa", "com", "sem", "uma", "dos", "das", "nao", "sim",
+              "tem", "ter", "ver", "aqui", "sobre", "esta", "este", "preciso",
+              "gostaria", "posso", "pode", "the", "and", "you", "meu"}
+
+
+def _help_tokens(s):
+    return set(t for t in _help_norm(s).split()
+               if len(t) > 2 and t not in _HELP_STOP)
+
+
+def _help_strip_html(s):
+    return re.sub(r"<[^>]+>", " ", s or "")
+
+
+def _help_kb_to_html(text):
+    """Converte uma passagem da base de conhecimento (texto) em HTML curto."""
+    lines = [l.strip() for l in _help_strip_html(text).split("\n") if l.strip()]
+    html = []
+    for l in lines[:9]:
+        html.append(("• " + l[2:]) if l.startswith("- ") else l)
+    return "<br>".join(html)
+
+
+# ============================================================
+# Bases de conhecimento EMBUTIDAS (fallback p/ atualizacao a quente,
+# que troca so o .py). Se o .md existir em disco, ele tem prioridade.
+# ============================================================
+GUIA_METODOLOGICO_EMBED = """
+# Guia metodológico — EEG, Imaginação Motora e BCI
+
+Base de conhecimento consultiva do OpenBionica. As orientações abaixo são
+**embasadas em literatura publicada** (referências ao final de cada tema). O
+assistente usa este guia para responder "como devo abordar…", "qual a melhor
+prática para…" e sugerir caminhos coerentes. Quando um tema não estiver aqui,
+o assistente recomenda contatar o suporte/orientador ou contribuir no código
+aberto.
+
+---
+
+## Como abordar um estudo de imaginação motora de membro superior
+
+Roteiro prático e embasado, do zero ao resultado:
+
+1. **Pergunta e desenho.** Defina as classes (ex.: mão esquerda × direita;
+   ou mão × repouso). Para pós-AVC e reabilitação, foque em **imaginação
+   cinestésica** (sentir o movimento), não visual — ela gera ERD/ERS mais
+   robustos [Neuper 2005].
+2. **Montagem.** Padrão internacional 10–20, priorizando o córtex
+   sensoriomotor: **C3, Cz, C4** (mão/membro superior) e, se possível,
+   FC3/FC4, CP3/CP4 para melhorar filtros espaciais [Klem 1999; Blankertz 2008].
+3. **Paradigma por trial.** Repouso → cue (aviso) → janela de MI (~4–5 s) →
+   intervalo. Descarte os primeiros ~0,5 s (reação) e analise **0,5–2,5 s
+   pós-cue**, janela consagrada na BCI Competition IV [Ang 2008; Tangermann 2012].
+4. **Bandas.** **mu (8–13 Hz)** e **beta (13–30 Hz)** são as bandas
+   sensoriomotoras onde ocorre a dessincronização (ERD) durante a MI e a
+   ressincronização (ERS / beta rebound) após [Pfurtscheller & Lopes da Silva 1999].
+5. **Pré-processamento.** Filtro passa-banda (ex.: 8–30 Hz para MI), notch da
+   rede (50/60 Hz), remoção de artefatos oculares por regressão ou ICA
+   [Makeig 1996; Jung 2000].
+6. **Extração de padrões.** ERD/ERS por banda e **filtros espaciais** —
+   Laplaciano de superfície (simples) ou **CSP/FBCSP** (mais potente para
+   classificação) [Ramoser 2000; Blankertz 2008; Ang 2008].
+7. **Classificação e validação.** LDA/CSP é a linha de base robusta; valide com
+   **validação cruzada agrupada por trial** (GroupKFold) para **não haver
+   vazamento** entre janelas do mesmo trial [Lotte 2018; Brookshire 2024].
+8. **Amostra.** Espere que 15–30% dos voluntários sejam "BCI-illiterate"
+   (baixo desempenho) — faça triagem (ex.: MIQ-RS) e planeje n com folga
+   [Sannelli 2019]. Colete em **≥ 2 dias** para capturar variabilidade
+   inter-dia [Ma 2022].
+
+**No OpenBionica:** grave em *Nova Coleta*/protocolo → analise em
+*Analisar → Offline* (FFT, bandas, ERS/ERD, topografia) → use a *Área Maker*
+para montar a métrica (recorte → filtro → banda) e rodar em várias sessões.
+
+> Refs: Pfurtscheller & Lopes da Silva 1999; Neuper 2005; Klem 1999;
+> Blankertz 2008; Ang 2008; Ramoser 2000; Lotte 2018; Ma 2022; Sannelli 2019.
+
+---
+
+## ERD/ERS — o que é e como calcular
+
+**ERD (Event-Related Desynchronization)** é a queda de potência em mu/beta
+sobre o córtex sensoriomotor durante o preparo/execução/imaginação do
+movimento; **ERS** é o aumento (ressincronização), típico do *beta rebound*
+pós-movimento. É o marcador fisiológico central da imaginação motora
+[Pfurtscheller & Lopes da Silva 1999].
+
+**Cálculo (método clássico, "band power"):**
+1. Filtre na banda de interesse (ex.: mu 8–13 Hz).
+2. Eleve o sinal ao quadrado (potência instantânea) e suavize (média móvel).
+3. ERD%(t) = 100 × (P(t) − P_ref) / P_ref, onde **P_ref** é a potência média
+   em uma **janela de referência (baseline)** de repouso antes do cue.
+- ERD% negativo = dessincronização (esperado na MI); positivo = ERS.
+- Lateralização: compare **C3 × C4** (a MI de uma mão gera ERD contralateral).
+
+**Boas práticas:** baseline de 1–2 s imediatamente antes do cue; média sobre
+trials da mesma classe; reporte por banda e por canal.
+
+> Refs: Pfurtscheller & Lopes da Silva 1999; Pfurtscheller & Neuper 2001.
+
+---
+
+## Cinestésica vs visual, e quantos trials
+
+**Imaginação cinestésica** (sentir a contração/esforço, 1ª pessoa) ativa mais
+M1/SMA e produz ERD/ERS mais classificáveis do que a **visual** (ver-se de
+fora) [Neuper 2005]. Instrua o voluntário a *sentir* o movimento sustentado,
+sem executar de verdade.
+
+**Número de trials:** para análise/treino robusto, mire **≥ 40–72 trials por
+classe** distribuídos em partes com pausas (fadiga cai o desempenho). Para BCI
+online, calibração de ~20–40 trials/classe é comum; datasets canônicos usam
+72/classe (BCI Comp IV-2a) [Tangermann 2012].
+
+> Refs: Neuper 2005; Tangermann 2012.
+
+---
+
+## Artefatos: como limpar (piscadas, músculo, rede)
+
+- **Piscadas/olhos (EOG):** aparecem forte em Fp1/Fp2. Remova por **ICA**
+  (excluir componentes de blink) ou regressão por canais frontais
+  [Makeig 1996; Jung 2000]. No OpenBionica: *Analisar → Offline →
+  "Limpar artefatos (ICA)"* — roda em numpy puro, **sem instalar nada**, e
+  salva `data_clean.csv`.
+- **Músculo (EMG):** energia em alta frequência (>30 Hz), pior em T3/T4.
+  Evite instruindo relaxamento; filtre e/ou marque trials ruins.
+- **Rede elétrica:** notch em 50 ou 60 Hz (Brasil = 60 Hz).
+- **Regra prática:** trial com artefato deve ser **sinalizado e excluído** do
+  treino, não "corrigido à força".
+
+> Refs: Makeig 1996; Jung 2000; Picton 2000; Keil 2014.
+
+---
+
+## Classificação e validação (evitar vazamento)
+
+- **Linha de base robusta:** CSP (filtro espacial) + LDA. FBCSP para
+  multi-banda [Ramoser 2000; Ang 2008]. Revisão ampla de classificadores em
+  [Lotte 2018].
+- **Validação:** nunca misture janelas do **mesmo trial** entre treino e teste.
+  Use **GroupKFold por trial_id**; para generalização entre pessoas, use
+  **LOSO (Leave-One-Subject-Out)**. Ignorar isso infla a acurácia
+  artificialmente [Brookshire 2024].
+- **Cross-session:** desempenho cai muito entre dias sem adaptação; treine com
+  dados de ≥ 2 dias [Ma 2022; Huang 2023].
+- **Métricas:** reporte acurácia **e** kappa de Cohen (corrige acaso).
+
+> Refs: Ramoser 2000; Ang 2008; Lotte 2018; Brookshire 2024; Ma 2022.
+
+---
+
+## Análise visual: topografia, LORETA e localização de fonte
+
+**Mapa topográfico (topomap)** projeta a potência/banda por eletrodo em uma
+vista da cabeça (interpolação 2D). É rápido e ótimo para ver *onde* está a
+atividade, mas mostra **potencial de escalpo**, não a fonte — sofre de
+**condução de volume** [Nunez & Srinivasan 2006].
+
+Para ir além do topomap simples:
+- **Laplaciano de superfície / CSD (Current Source Density):** realça fontes
+  locais e reduz condução de volume; é uma referência espacial "sem
+  referência" [McFarland 1997; Nunez & Srinivasan 2006]. É barato (só a
+  geometria dos eletrodos) e melhora muito a nitidez do topomap.
+- **Localização de fonte (LORETA/sLORETA):** estima a distribuição de corrente
+  no volume cerebral a partir do EEG de escalpo. **LORETA** assume solução
+  suave (mínima Laplaciana); **sLORETA** é a versão padronizada com
+  localização de erro zero para fonte única [Pascual-Marqui 1994; 2002].
+  Requer um modelo de cabeça/leadfield.
+
+**Comparação honesta OpenBionica × LORETA/EEGLAB/MNE:** o OpenBionica é um
+coletor+analisador leve (topomap 2D, FFT, bandas, ERS/ERD). LORETA/sLORETA e
+localização de fonte 3D são o domínio de **MNE-Python** [Gramfort 2013] e do
+**EEGLAB** [Delorme 2004]. Caminho recomendado: usar o OpenBionica para
+coleta/triagem visual e **exportar para MNE/EEGLAB** (o software já exporta
+EDF/BIDS) quando precisar de tomografia de fonte.
+
+> Refs: Nunez & Srinivasan 2006; McFarland 1997; Pascual-Marqui 1994, 2002;
+> Gramfort 2013 (MNE); Delorme 2004 (EEGLAB).
+
+---
+
+## Referências
+
+- Ang KK, Chin ZY, Zhang H, Guan C (2008). *Filter Bank Common Spatial Pattern
+  (FBCSP) in Brain–Computer Interface.* IJCNN, p.2390–2397.
+- Blankertz B, Tomioka R, Lemm S, Kawanabe M, Müller KR (2008). *Optimizing
+  spatial filters for robust EEG single-trial analysis.* IEEE Signal Process
+  Mag 25(1):41–56.
+- Brookshire G et al. (2024). *Data leakage in deep learning studies of
+  translational EEG.* Front Neurosci 18:1373515.
+- Delorme A, Makeig S (2004). *EEGLAB: an open source toolbox…* J Neurosci
+  Methods 134(1):9–21.
+- Gramfort A et al. (2013). *MEG and EEG data analysis with MNE-Python.* Front
+  Neurosci 7:267.
+- Huang G et al. (2023). *Discrepancy between inter- and intra-subject
+  variability in EEG-based MI BCI.* Front Neurosci 17:1122661.
+- Jung TP et al. (2000). *Removing electroencephalographic artifacts by blind
+  source separation.* Psychophysiology 37(2):163–178.
+- Keil A et al. (2014). *Committee report: publication guidelines… EEG/MEG.*
+  Psychophysiology 51(1):1–21.
+- Klem GH, Lüders HO, Jasper HH, Elger C (1999). *The ten–twenty electrode
+  system of the International Federation.* Electroencephalogr Clin Neurophysiol
+  Suppl 52:3–6.
+- Lotte F et al. (2018). *A review of classification algorithms for EEG-based
+  BCI: a 10-year update.* J Neural Eng 15(3):031005.
+- Ma J et al. (2022). *A large EEG dataset for studying cross-session
+  variability in MI BCI.* Sci Data 9:531.
+- Makeig S, Bell AJ, Jung TP, Sejnowski TJ (1996). *Independent component
+  analysis of electroencephalographic data.* NIPS 8:145–151.
+- McFarland DJ, McCane LM, David SV, Wolpaw JR (1997). *Spatial filter
+  selection for EEG-based communication.* Electroencephalogr Clin Neurophysiol
+  103(3):386–394.
+- Neuper C, Scherer R, Reiner M, Pfurtscheller G (2005). *Imagery of motor
+  actions: differential effects of kinesthetic and visual-motor mode of imagery
+  in single-trial EEG.* Cogn Brain Res 25(3):668–677.
+- Nunez PL, Srinivasan R (2006). *Electric Fields of the Brain: The Neurophysics
+  of EEG.* 2ª ed., Oxford Univ. Press.
+- Pascual-Marqui RD, Michel CM, Lehmann D (1994). *Low resolution
+  electromagnetic tomography (LORETA).* Int J Psychophysiol 18(1):49–65.
+- Pascual-Marqui RD (2002). *Standardized low-resolution brain electromagnetic
+  tomography (sLORETA).* Methods Find Exp Clin Pharmacol 24 Suppl D:5–12.
+- Pfurtscheller G, Lopes da Silva FH (1999). *Event-related EEG/MEG
+  synchronization and desynchronization: basic principles.* Clin Neurophysiol
+  110(11):1842–1857.
+- Pfurtscheller G, Neuper C (2001). *Motor imagery and direct brain–computer
+  communication.* Proc IEEE 89(7):1123–1134.
+- Picton TW et al. (2000). *Guidelines for using human event-related
+  potentials…* Psychophysiology 37(2):127–152.
+- Ramoser H, Müller-Gerking J, Pfurtscheller G (2000). *Optimal spatial
+  filtering of single trial EEG during imagined hand movement.* IEEE Trans
+  Rehabil Eng 8(4):441–446.
+- Sannelli C, Vidaurre C, Müller KR, Blankertz B (2019). *A large scale
+  screening study with a SMR-based BCI.* PLOS ONE 14(1):e0207351.
+- Tangermann M et al. (2012). *Review of the BCI Competition IV.* Front Neurosci
+  6:55.
+"""
+
+BASE_CONHECIMENTO_EMBED = """
+# Base de Conhecimento — OpenBiônica (OpenBionica)
+
+_Gerado automaticamente a partir do manual do usuário. É o corpus que o assistente de ajuda offline indexa para responder às perguntas._
+
+## Introdução
+
+O OpenBiônica é um aplicativo para coleta, visualização e análise
+de sinais de eletroencefalografia (EEG) em tempo real, compatível com a placa
+OpenBCI Cyton (8 ou 16 canais, 250,Hz). Ele oferece visualização multicanal,
+filtros, mapas topográficos, análise espectral, ERS/ERD e um treinador de
+Brain–Computer Interface (BCI), além de exportação para formatos clínicos
+e científicos.
+
+Além do EEG, o software é multimodal (aceita também EMG, ECG, EoG e
+acelerômetro) e traz um facilitador estatístico que escolhe e executa o
+teste adequado automaticamente — você compara condições ou grupos sem precisar
+dominar estatística (Seção). Para confiabilidade, registra
+proveniência (versão + repositório) em cada exportação, mantém um log de
+aplicação e possui recuperação de erros que evita fechamentos silenciosos.
+
+> Dica: 
+Este é um software de pesquisa, sem aprovação como dispositivo médico.
+Destina-se a pesquisa acadêmica, educação e desenvolvimento de protocolos —
+não deve ser usado para diagnóstico ou decisões clínicas.
+
+## Instalação e primeira execução
+
+- Descompacte o arquivo Software EEG.zip em uma pasta de sua
+preferência (ex.: Área de Trabalho).
+- Dê um duplo clique em EEG_Collector.exe.
+- Na primeira vez, o Windows pode exibir um aviso do SmartScreen.
+Clique em Mais informações → Executar assim mesmo
+(isso ocorre porque o executável não tem assinatura digital paga; é seguro).
+- A janela abre em cerca de 10–20,s na primeira execução.
+
+> Dica: 
+O .exe já contém tudo o que é necessário para rodar. Alternativamente,
+quem tiver Python 3.10+ pode executar python EEG_Data_Collector.py.
+
+## Primeiro uso: idioma, layout e Termo de Uso
+
+Na primeira vez que você abre o programa, um assistente guia três
+passos rápidos (s e ):
+
+- Idioma da interface (Português, English ou Español).
+- Layout inicial dos painéis (pode mudar depois em
+Visualizar → Layout Custom).
+- Termo de Consentimento e Uso — leia e marque Li, entendi e
+concordo para concluir. O programa só abre após o aceite.
+
+> Dica: 
+O software funciona offline e não coleta, não envia e não
+compartilha nenhum dado — tudo permanece na sua máquina. Você pode reler o termo
+a qualquer momento em Ajuda → Termo de uso e privacidade; o
+aceite (versão e data) fica registrado apenas no seu computador.
+
+## Tela inicial
+
+Ao abrir, surge a tela de boas-vindas (, dividida
+em três áreas:
+
+- Esquerda — Voluntário e sessões: selecione um voluntário já
+cadastrado ou clique em + Novo para cadastrar. Veja também as
+sessões recentes e o botão Abrir CSV manualmente.
+- Centro — Fluxos de trabalho: escolha o que deseja fazer:
+Nova Coleta (conectar e gravar), Analisar Dados (abrir um CSV
+já gravado), Aplicações BCI ou Modo Simulação (gera sinal
+sintético, sem hardware).
+- Direita — Pré-flight check: defina a Porta COM, o
+Número de canais e o Tipo de Aquisição antes de iniciar.
+
+> Dica: 
+Para testar o programa sem hardware, escolha Modo Simulação — todas
+as telas funcionam com um sinal sintético.
+
+## Coleta de dados em tempo real
+
+## Conexão
+
+Na aba Configurar → Conexão (:
+
+- Selecione a Porta COM da Cyton (use Atualizar para
+relistar). Para testes, troque o Modo para Simulação.
+- Confira o Baud Rate (padrão 115200).
+- Dispositivos Bluetooth podem ser pareados pela seção correspondente.
+- O botão Demo 30s grava automaticamente uma sessão de exemplo
+(útil para validar a cadeia de processamento).
+
+## Visualização em tempo real
+
+A aba Visualizar → Tempo Real (
+mostra todos os canais empilhados, com o acelerômetro (X/Y/Z) na parte inferior.
+Ajuste a Escala ($$V/canal) e a Janela (segundos) conforme
+necessário.
+
+## Filtros e canais
+
+Em Configurar → Filtros e Canais (
+ative o notch (50/60,Hz, contra ruído de rede), o passa-banda
+(ex.: 1–50,Hz) e habilite/desabilite canais individualmente.
+
+> Dica: 
+Para imagética motora, um passa-banda de 8–30,Hz (faixas mu e beta) e o
+notch de 60,Hz costumam dar o melhor sinal.
+
+## Calibração (impedância)
+
+A aba Calibração ( realiza o teste de
+impedância dos eletrodos (em k$$). Verifique se os eletrodos estão
+com bom contato antes de gravar — valores altos indicam contato ruim.
+
+## Gravar uma sessão
+
+- Clique em Conectar e aguarde o sinal estabilizar.
+- Clique em Iniciar Gravação.
+- Use os Marcadores (atalhos de teclado / botões de evento) para
+anotar os momentos relevantes (repouso, estímulo, imagética, etc.).
+- Clique em Parar Gravação. Os arquivos são salvos em
+sessions/<sujeito>_<data>_<hora>/ (EEG em data.csv,
+eventos, log, summary.json com integridade SHA-256 e snapshots).
+
+## Análise dos sinais
+
+## Análises (FFT, bandas, estatísticas)
+
+A aba Analisar → Análises (
+exibe a FFT do canal escolhido, a potência por banda EEG ($,,,
+,$) e estatísticas por canal.
+
+## Topografia (mapa de calor)
+
+A aba Topografia ( mostra o
+head plot 10–20 com interpolação, além de Focus e EMG.
+
+## Espectrograma
+
+A aba Espectrograma ( apresenta o
+mapa de calor frequência $×$ tempo por canal.
+
+## Análise offline de sessões gravadas
+
+A aba Analisar → Offline (
+permite abrir um data.csv já gravado, arrastar uma região de
+interesse sobre o sinal e ver, para a seleção, a FFT, as bandas e as estatísticas
+por canal — respeitando a taxa de amostragem real do arquivo.
+
+## ERS/ERD (imagética motora)
+
+A aba Analisar → ERS/ERD (
+calcula a dessincronização/sincronização relacionada a evento:
+
+- Clique em Carregar CSV BCI e selecione a sessão.
+- Escolha a Classe, a Banda (ex.: Mu 8–13,Hz) e a
+Baseline (use baseline = repouso para o ERD fisiológico).
+- Clique em Computar ERS/ERD. Veja a topografia, as barras de ERD%
+por canal e o curso temporal. ERD,$<$,0 = dessincronização
+(marcador típico de imagética motora).
+
+## Treinador BCI
+
+A aba Analisar → BCI Trainer (
+treina um classificador (CSP + LDA) de imagética motora a partir dos trials
+gravados, indicando a acurácia obtida.
+
+## Facilitador estatístico
+
+O software escolhe o teste estatístico por você: verifica a normalidade
+(Shapiro–Wilk) e, conforme o caso, aplica t de Welch/Student, Wilcoxon,
+Mann–Whitney, ANOVA ou Kruskal–Wallis; calcula o tamanho de efeito (Cohen d),
+corrige múltiplas comparações (Holm) e explica o resultado em linguagem
+simples. Ideal para clínicos, estudantes e engenheiros — sem exigir conhecimento
+prévio de estatística.
+
+> Dica: 
+O facilitador compara as condições que existirem nos seus dados (classes,
+marcadores, repouso) pela métrica que você escolher — não assume nenhum movimento
+específico. Serve igualmente para tornozelo, mão, EMG, etc.
+
+## Comparar grupos de sessões (ex.: Antes $×$ Depois)
+
+Em Analisar → Offline, clique em Estatística guiada
+(comparar grupos) (:
+
+- Em Grupo A e Grupo B, clique em Selecionar
+sessões… e escolha os arquivos de cada condição (ex.: antes e depois de
+um protocolo). Marque Amostras pareadas se forem os mesmos sujeitos.
+- Clique em Comparar. A tabela mostra, por banda
+((,,,,)), o teste escolhido, o valor de
+p, o p corrigido (Holm), o efeito e se houve diferença.
+- Leia o resumo em texto e, se quiser, clique em Salvar relatório
+(HTML + CSV).
+
+## Comparar condições de uma sessão
+
+Ainda na aba Offline, Comparar condições da sessão
+( compara, dentro de uma sessão,
+as condições detectadas (classes, marcadores ou tarefa $×$ repouso). Escolha
+a métrica (potência de banda, RMS ou ERD% vs. repouso), a banda
+e os canais; o teste é selecionado automaticamente.
+
+## Área Maker — Receitas de análise
+
+A Área Maker ( deixa você montar
+uma análise conforme a sua necessidade, sem programar, e salvá-la como
+receita para reutilizar ou compartilhar. Acesse em Analisar
+→ Offline → Receitas de análise (Área Maker):
+
+- Escolha a métrica (potência de banda, RMS, amplitude
+pico-a-pico ou desvio-padrão), a banda e os canais
+(vazio = todos, ou ex.: 1,2,3).
+- (Opcional, pipeline) defina um recorte temporal
+(início--fim em segundos) e/ou um pré-filtro passa-banda
+(Hz) — a receita aplica recorte → filtro
+→ métrica.
+- Clique em Adicionar sessões e selecione um ou mais arquivos.
+- Clique em Rodar: a tabela mostra o valor por canal, com uma
+coluna por sessão (ótimo para comparar, ex.: Antes (×) Depois).
+- Salvar receita grava um .json reutilizável; Carregar
+receita reaplica; Exportar tabela salva o resultado em CSV.
+
+.
+
+## Exportação
+
+Pela aba de Configurações → Sessão & Arquivos, é possível
+exportar a sessão para:
+
+- EDF/EDF+ — formato clínico padrão;
+- FIF — formato científico (MNE-Python);
+- BIDS — estrutura padronizada para compartilhamento de dados;
+- PDF — relatório automático (sinal + FFT + bandas por canal),
+com veredito de qualidade (APTO / DUVIDOSO / DESCARTAR).
+
+> Dica: 
+Toda exportação carimba a proveniência (versão do programa e endereço do
+repositório), para que qualquer análise possa ser rastreada até o software que a
+gerou.
+
+## Ferramentas
+
+No menu Ferramentas:
+
+- Perfil de protocolo (Exportar/Importar) — salva sua
+montagem (mapeamento de eletrodos, tipos de sinal por canal,
+ajustes de EMG e limites de impedância) num arquivo .json
+reutilizável. Importe-o em outra máquina para reproduzir o mesmo setup
+(reabra o programa para aplicar por completo).
+- Área Maker — atalho para as receitas de análise.
+- Abrir pasta de logs — vai direto para
+Documentos/EEG_Coletor/logs (útil para anexar a um relato de
+problema).
+
+## Atualizações (opcionais e manuais)
+
+Por padrão o programa funciona 100% offline e não faz nenhuma
+conexão automática (privacidade). Quando você quiser, verifique se há uma
+versão nova em Ajuda → Verificar atualizações:
+
+- Havendo versão nova, o programa mostra o resumo das mudanças e pergunta se
+deseja baixar (. Apenas o código é
+trocado (rápido); reabra o programa para usar a nova versão.
+- Se estiver offline, aparece uma mensagem amigável e nada é alterado.
+
+de atualização (opcional).
+
+> Dica: 
+A verificação só baixa código — nunca envia seus dados. O
+download é conferido por assinatura SHA-256 (rejeita arquivo alterado).
+
+## Assistente de ajuda (offline)
+
+Em dúvida? Pressione F1 ou vá em Ajuda → Assistente
+de ajuda para abrir um chat que responde sobre o uso do programa
+(. Ele busca localmente numa base
+de perguntas frequentes e no catálogo de erros — nada sai da sua máquina
+(sem IA na nuvem, sem internet). Digite uma pergunta (ex.: como faço
+impedância?) ou um código de erro (ex.: E115); há também botões de tema
+(Conexão, Calibração, Exportar, Estatística, Erros, Privacidade).
+: chat de
+perguntas frequentes e códigos de erro, sem enviar dados para fora.
+
+## Solução de problemas
+
+- O Windows bloqueou o programa (SmartScreen).: Clique em Mais
+informações → Executar assim mesmo.
+- Não aparece nenhuma porta COM.: Verifique o cabo/dongle da Cyton e clique
+em Atualizar; ou use o Modo Simulação para testar.
+- Sinal ruidoso ou amplitude estranha.: Refaça a calibração de impedância,
+melhore o contato dos eletrodos e ative o notch de 60,Hz.
+- Onde ficam minhas gravações?: Na subpasta sessions/ ao lado do
+executável, uma pasta por sessão.
+- O programa apresentou um erro.: Ele mostra um aviso e salva um
+relatório em Documentos/EEG_Coletor/logs/app.log. Anexe esse
+arquivo ao relatar o problema — ele ajuda a diagnosticar.
+
+## Códigos de erro (Erro E0XX
+)
+Quando algo dá errado, o programa mostra uma notificação com um código
+(ex.: Erro E001) e uma explicação do que aconteceu e do que fazer
+(. Os códigos seguem faixas:
+E0xx conexão, E1xx arquivos/exportação, E2xx análise,
+E3xx configuração, E4xx atualização, E5xx dependências,
+E6xx interface e E999 (erro inesperado). A lista completa está
+no arquivo ERROS.md.
+): o que aconteceu, o que fazer e o detalhe técnico.
+
+Para conhecer ou testar as mensagens, use Ajuda →
+Diagnóstico de erros (simular) (:
+selecione um código e clique em Simular notificação.
+
+lime
+OpenBiônica — Edição Clínica | OpenBionica
+"""
+
+
+def _help_load_text(fname, embed=""):
+    """Le um .md de conhecimento do disco (SCRIPT_DIR/DOC_DIR/_MEIPASS)
+    ou, se ausente/vazio, usa a copia EMBUTIDA no proprio .py. Isso torna
+    o codigo autossuficiente: a atualizacao a quente (que so troca o .py)
+    nao depende de arquivos-satelite."""
+    cands = [os.path.join(SCRIPT_DIR, fname), os.path.join(DOC_DIR, fname)]
+    if _MEIPASS_DIR:
+        cands.append(os.path.join(_MEIPASS_DIR, fname))
+    for p in cands:
+        try:
+            if os.path.exists(p):
+                t = open(p, encoding="utf-8").read()
+                if t and t.strip():
+                    return t
+        except Exception:
+            pass
+    return embed or ""
+
+
+def _help_read_kb():
+    """Le BASE_CONHECIMENTO.md (disco ou EMBUTIDO) e fatia por seções '## '."""
+    txt = _help_load_text("BASE_CONHECIMENTO.md", BASE_CONHECIMENTO_EMBED)
+    out = []
+    for chunk in re.split(r"\n##\s+", txt or ""):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split("\n", 1)
+        title = parts[0].lstrip("# ").strip()
+        body = parts[1].strip() if len(parts) > 1 else ""
+        if len(body) > 20:
+            out.append((title, body))
+    return out
+
+
+_HELP_CORPUS = None   # cache: lista de docs {title, answer, ref, kind, tok}
+_HELP_IDF = None      # cache: term -> idf
+
+
+def _help_corpus():
+    """Monta (1x) o corpus indexado: FAQ + base de conhecimento (manual) +
+    catalogo de erros, com IDF para ranqueamento TF-IDF. Tudo OFFLINE."""
+    global _HELP_CORPUS, _HELP_IDF
+    if _HELP_CORPUS is not None:
+        return _HELP_CORPUS, _HELP_IDF
+    docs = []
+    for e in HELP_FAQ:                                   # FAQ curada (precisao)
+        docs.append({"title": e["t"], "kind": "faq", "ref": e.get("ref", ""),
+                     "answer": e["a"],
+                     "text": e["k"] + " " + e["t"] + " " + _help_strip_html(e["a"])})
+    for title, body in _help_read_kb():                  # manual (cobertura)
+        docs.append({"title": title, "kind": "kb", "ref": "Manual do usuário",
+                     "answer": _help_kb_to_html(body), "text": title + " " + body})
+    for code, (t, msg, _b) in ERROR_CATALOG.items():     # catalogo de erros
+        docs.append({"title": f"Erro {code} — {t}", "kind": "err",
+                     "ref": "Ajuda → Diagnóstico de erros", "answer": msg,
+                     "text": f"{code} {t} {msg}"})
+    df = {}
+    for d in docs:
+        d["tok"] = _help_tokens(d["text"])
+        for term in d["tok"]:
+            df[term] = df.get(term, 0) + 1
+    n = max(1, len(docs))
+    _HELP_IDF = {term: math.log((n + 1) / (c + 1)) + 1.0 for term, c in df.items()}
+    _HELP_CORPUS = docs
+    return _HELP_CORPUS, _HELP_IDF
+
+
+def help_answer(query, limit=3):
+    """Busca OFFLINE por recuperacao TF-IDF sobre FAQ + manual + erros. Retorna
+    [(titulo, resposta_html, ref)]. NADA sai da maquina."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    m = re.search(r"\bE\d{3}\b", q.upper())              # codigo de erro explicito
+    if m and m.group() in ERROR_CATALOG:
+        code = m.group(); title, msg, _b = error_info(code)
+        return [(f"Erro {code} — {title}", msg, "Ajuda → Diagnóstico de erros")]
+    qtok = _help_tokens(q)
+    if not qtok:
+        return []
+    docs, idf = _help_corpus()
+    qn = _help_norm(q)
+    scored = []
+    for d in docs:
+        inter = qtok & d["tok"]
+        if not inter:
+            continue
+        score = sum(idf.get(term, 1.0) for term in inter)
+        if d["kind"] == "faq":                           # FAQ tem prioridade
+            score *= 1.35
+            score += difflib.SequenceMatcher(None, qn, _help_norm(d["text"][:120])).ratio()
+        if qtok & _help_tokens(d["title"]):              # bonus de titulo
+            score += 1.0
+        scored.append((score, d))
+    if not scored:
+        return []
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if scored[0][0] < 1.2:                               # limiar de relevancia
+        return []
+    out, seen = [], set()
+    for _s, d in scored:
+        if d["title"] in seen:
+            continue
+        seen.add(d["title"])
+        out.append((d["title"], d["answer"], d["ref"]))
+        if len(out) >= limit:
+            break
+    return out
+
+
+# ============================================================
+# Consultor metodológico — raciocínio focado sobre GUIA_METODOLOGICO.md
+# (offline: nada sai da máquina; respostas embasadas em literatura)
+# ============================================================
+_GUIA_CACHE = None
+
+
+def _html_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("'", "&#39;").replace('"', "&quot;"))
+
+
+def _help_read_guia():
+    """Lê GUIA_METODOLOGICO.md e devolve [(titulo, corpo, refs)] por seção '## '.
+    Separa a linha '> Refs:' do corpo. Cacheado. Tudo OFFLINE."""
+    global _GUIA_CACHE
+    if _GUIA_CACHE is not None:
+        return _GUIA_CACHE
+    txt = _help_load_text("GUIA_METODOLOGICO.md", GUIA_METODOLOGICO_EMBED)
+    out = []
+    for chunk in re.split(r"\n##\s+", txt or ""):
+        chunk = chunk.strip()
+        if not chunk or chunk.startswith("#"):
+            continue
+        parts = chunk.split("\n", 1)
+        title = parts[0].lstrip("# ").strip()
+        if title.lower().startswith("refer"):
+            continue
+        body = parts[1].strip() if len(parts) > 1 else ""
+        refs = ""
+        mref = re.search(r"(?ms)^>\s*Refs?:\s*(.+?)\s*$", body)
+        if mref:
+            refs = re.sub(r"\s+", " ", mref.group(1)).strip().rstrip(".")
+            body = body[:mref.start()].strip()
+        if len(body) > 20:
+            out.append((title, body, refs))
+    _GUIA_CACHE = out
+    return out
+
+
+def _md_to_chat_html(text):
+    """Converte um trecho markdown (do guia) em HTML de balão de chat:
+    **negrito**, *itálico*, listas numeradas/marcadas e citações [Autor ANO]."""
+    import html as _html
+    acc = COLORS.get("accent", "#0f9d75")
+
+    def fmt(t):
+        t = _html.escape(t)
+        t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+        t = re.sub(r"\*(.+?)\*", r"<i>\1</i>", t)
+        t = re.sub(r"\[([^\]\[]*?\d{4}[^\]\[]*?)\]",
+                   r"<span style='color:%s'>[\1]</span>" % acc, t)
+        return t
+
+    html, in_ul = [], False
+    for ln in text.split("\n"):
+        s = ln.rstrip()
+        if not s.strip() or s.lstrip().startswith(">"):
+            continue
+        m_num = re.match(r"^\s*(\d+)\.\s+(.*)", s)
+        m_bul = re.match(r"^\s*[-•]\s+(.*)", s)
+        if m_num:
+            if in_ul:
+                html.append("</ul>"); in_ul = False
+            html.append("<div style='margin:3px 0'><b>%s.</b> %s</div>"
+                        % (m_num.group(1), fmt(m_num.group(2))))
+        elif m_bul:
+            if not in_ul:
+                html.append("<ul style='margin:3px 0 3px 4px'>"); in_ul = True
+            html.append("<li style='margin:2px 0'>%s</li>" % fmt(m_bul.group(1)))
+        else:
+            if in_ul:
+                html.append("</ul>"); in_ul = False
+            html.append("<div style='margin:4px 0'>%s</div>" % fmt(s))
+    if in_ul:
+        html.append("</ul>")
+    return "".join(html)
+
+
+# Metadados por seção do guia: "lead" (frase de abertura, dá foco) e
+# perguntas de aprofundamento clicáveis. 'match' liga ao título da seção.
+_GUIA_META = [
+    {"match": "imaginação motora de membro superior",
+     "hint": "abordar abordagem estudo desenho protocolo planejar comecar iniciar "
+             "membro superior imagetica imaginacao motora reabilitacao roteiro "
+             "montagem eletrodo pipeline como comeco por onde",
+     "strong": "abordar abordagem metodologia protocolo estudo membro imagetica",
+     "lead": "Entendi — você quer <b>planejar um estudo de imaginação motora de "
+             "membro superior</b>. Vou por partes, do desenho ao resultado:",
+     "follow": [("Detalhar ERD/ERS", "o que é ERD/ERS e como calcular"),
+                ("Quantos trials?", "cinestésica vs visual e quantos trials"),
+                ("Limpar artefatos", "como limpar artefatos piscadas ICA"),
+                ("Validar sem viés", "classificação e validação sem vazamento")]},
+    {"match": "ERD/ERS",
+     "hint": "erd ers dessincronizacao ressincronizacao rebound beta rebound "
+             "band power baseline referencia lateralizacao c3 c4 calcular potencia mu",
+     "strong": "erd ers dessincronizacao rebound",
+     "lead": "ERD/ERS é o <b>marcador fisiológico central</b> da imaginação "
+             "motora. O que é e como calcular:",
+     "follow": [("Fazer no programa", "onde calculo ERS/ERD no programa"),
+                ("Qual baseline usar", "qual janela de baseline referência usar"),
+                ("Roteiro completo", "como abordar estudo de membro superior")]},
+    {"match": "Cinestésica vs visual",
+     "hint": "cinestesica visual trials tentativas quantos numero classe fadiga "
+             "instruir sentir movimento 72 40 imagetica modo primeira pessoa",
+     "strong": "cinestesica trials tentativas quantos",
+     "lead": "Duas decisões de desenho: <b>tipo de imaginação</b> e <b>nº de "
+             "trials</b>. A recomendação:",
+     "follow": [("Como instruir", "como instruir o voluntário na cinestésica"),
+                ("Roteiro completo", "como abordar estudo de membro superior"),
+                ("ERD/ERS", "o que é ERD/ERS e como calcular")]},
+    {"match": "Artefatos",
+     "hint": "artefato artefatos piscada piscadas olho ocular eog musculo emg "
+             "rede notch ruido limpar ica remover contaminacao frontal fp1 fp2",
+     "strong": "artefato piscada ocular ica musculo notch",
+     "lead": "Para <b>limpar artefatos</b> (piscadas, músculo, rede) sem "
+             "distorcer o sinal:",
+     "follow": [("Rodar ICA no programa", "como rodar o ICA no programa"),
+                ("O que é ICA", "o que é ICA análise de componentes independentes"),
+                ("Marcar trials ruins", "como marcar e excluir trials ruins")]},
+    {"match": "Classificação e validação",
+     "hint": "classificar classificacao validar validacao vazamento leakage csp "
+             "fbcsp lda groupkfold loso cross session acuracia kappa treino teste "
+             "generalizacao inflar sujeitos",
+     "strong": "vazamento leakage csp loso groupkfold classificacao validacao",
+     "lead": "A parte que mais <b>infla resultado</b> quando feita errado. "
+             "Linha de base e como validar direito:",
+     "follow": [("Treinar BCI no programa", "como treino o classificador BCI"),
+                ("O que é vazamento", "o que é vazamento de dados leakage"),
+                ("Coletar em ≥2 dias", "por que coletar em mais de um dia")]},
+    {"match": "topografia, LORETA",
+     "hint": "topografia topomap loreta sloreta fonte localizacao laplaciano csd "
+             "current source density conducao volume mne eeglab comparar visual "
+             "mapa cabeca scalp tomografia",
+     "strong": "loreta sloreta topografia csd laplaciano fonte",
+     "lead": "Sobre <b>análise visual</b> e a comparação honesta com LORETA / "
+             "EEGLAB / MNE:",
+     "follow": [("Topografia no programa", "onde vejo a topografia no programa"),
+                ("O que é CSD/Laplaciano", "o que é laplaciano de superfície CSD"),
+                ("Exportar p/ MNE", "como exporto para MNE ou EEGLAB")]},
+]
+
+
+def consultor_answer(query):
+    """Consultor metodológico: classifica a INTENÇÃO e devolve UMA resposta
+    focada (não despeja trechos). Retorna dict ou None. Base: GUIA + literatura."""
+    secs = _help_read_guia()
+    if not secs:
+        return None
+    qtok = _help_tokens(query)
+    if not qtok:
+        return None
+    best, best_score = None, 0
+    for meta in _GUIA_META:
+        score = len(qtok & _help_tokens(meta["hint"]))
+        score += 2 * len(qtok & _help_tokens(meta.get("strong", "")))
+        if score > best_score:
+            best_score, best = score, meta
+    if not best or best_score < 1:
+        return None
+    sec = next((s for s in secs
+                if _help_norm(best["match"]) in _help_norm(s[0])), None)
+    if not sec:
+        return None
+    title, body, refs = sec
+    return {"kind": "guia", "title": title, "lead": best["lead"],
+            "body_html": _md_to_chat_html(body), "refs": refs,
+            "follow": best["follow"], "score": best_score}
+
+
+class HelpAssistantDialog(QtWidgets.QDialog):
+    """Consultor OpenBionica (OFFLINE): raciocina sobre a intenção e responde de
+    forma FOCADA — metodologia embasada (GUIA + literatura), uso do software
+    (FAQ/manual) e erros (catálogo). NENHUMA informação sai da máquina."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Consultor OpenBionica (offline)")
+        self.setMinimumSize(720, 640)
+        v = QtWidgets.QVBoxLayout(self)
+        self.view = QtWidgets.QTextBrowser()
+        self.view.setOpenLinks(False)          # tratamos os links (ask:/http)
+        self.view.setOpenExternalLinks(False)
+        self.view.anchorClicked.connect(self._on_anchor)
+        v.addWidget(self.view, 1)
+        # atalhos por tema (metodologia + software)
+        chips = QtWidgets.QHBoxLayout()
+        for label, q in (("Planejar estudo (MS)", "como abordar estudo de imaginação "
+                          "motora de membro superior"),
+                         ("ERD/ERS", "o que é ERD/ERS e como calcular"),
+                         ("Artefatos/ICA", "como limpar artefatos piscadas ICA"),
+                         ("Validação", "classificação e validação sem vazamento"),
+                         ("Topografia/LORETA", "topografia LORETA localização de fonte"),
+                         ("Erros (E0XX)", "código de erro")):
+            b = QtWidgets.QPushButton(label)
+            b.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, t=q: self._ask(t))
+            chips.addWidget(b)
+        chips.addStretch(1)
+        v.addLayout(chips)
+        h = QtWidgets.QHBoxLayout()
+        self.input = QtWidgets.QLineEdit()
+        self.input.setPlaceholderText(
+            "Pergunte como um consultor (ex.: 'como abordo EEG de membro superior?' · "
+            "'qual banda para MI?' · 'E115')…")
+        self.input.returnPressed.connect(self._on_send)
+        btn = QtWidgets.QPushButton("Perguntar"); btn.clicked.connect(self._on_send)
+        btn.setDefault(True)
+        h.addWidget(self.input, 1); h.addWidget(btn)
+        v.addLayout(h)
+        try: self.setStyleSheet(build_stylesheet(COLORS))
+        except Exception: pass
+        self._html = []
+        self._intro()
+
+    # ---------- apresentação (balões) ----------
+    def _intro(self):
+        self._say("assistant",
+                  "Olá! Sou o <b>Consultor OpenBionica</b> — trabalho <b>100% offline</b> "
+                  "(nada sai da sua máquina). Diferente de uma busca, eu tento <b>entender "
+                  "sua intenção</b> e dar uma resposta <b>focada e embasada</b> (com "
+                  "referências).<br><br>Posso ajudar com <b>metodologia</b> (desenho de "
+                  "estudo, ERD/ERS, artefatos, validação, análise visual), <b>uso do "
+                  "programa</b> e <b>erros</b> (digite o código, ex.: <b>E115</b>).<br><br>"
+                  "Por onde começamos?",
+                  follow=[("Planejar um estudo de MS",
+                           "como abordar estudo de imaginação motora de membro superior"),
+                          ("Qual banda/janela para MI",
+                           "qual banda e janela usar para imaginação motora"),
+                          ("Comparar antes × depois",
+                           "como comparar antes e depois estatística")])
+
+    def _say(self, who, html, follow=None, refs=None):
+        acc = COLORS.get("accent", "#0f9d75")
+        surf = COLORS.get("surface_alt", "#efefef")
+        usr = COLORS.get("surface", "#ffffff")
+        dim = COLORS.get("text_dim", "#777")
+        inner = html
+        if refs:
+            inner += (f"<div style='margin-top:8px;color:{dim};font-size:11px'>"
+                      f"📚 <i>{refs}</i></div>")
+        if follow:
+            links = " &nbsp;·&nbsp; ".join(
+                f"<a href='ask:{_html_escape(q)}' style='color:{acc};"
+                f"text-decoration:none'>▸ {_html_escape(lbl)}</a>"
+                for lbl, q in follow)
+            inner += (f"<div style='margin-top:9px'>"
+                      f"<span style='color:{dim};font-size:11px'>Aprofundar:</span><br>"
+                      f"{links}</div>")
+        if who == "assistant":
+            bubble = (
+                f"<table cellspacing='0' cellpadding='0' width='88%'><tr>"
+                f"<td width='4' bgcolor='{acc}'></td>"
+                f"<td bgcolor='{surf}' style='padding:9px 12px'>"
+                f"<b style='color:{acc}'>🤝 Consultor</b><br>{inner}</td></tr></table>")
+            align = "left"
+        else:
+            bubble = (
+                f"<table cellspacing='0' cellpadding='0' width='78%'><tr>"
+                f"<td bgcolor='{usr}' style='padding:8px 12px;border:1px solid {surf}'>"
+                f"<b style='color:{dim}'>Você</b><br>{inner}</td></tr></table>")
+            align = "right"
+        self._html.append(
+            f"<table width='100%' cellspacing='0' cellpadding='0' "
+            f"style='margin:7px 0'><tr><td align='{align}'>{bubble}</td></tr></table>")
+        self.view.setHtml("".join(self._html))
+        sb = self.view.verticalScrollBar(); sb.setValue(sb.maximum())
+
+    def _on_send(self):
+        t = self.input.text().strip()
+        if t:
+            self.input.clear(); self._ask(t)
+
+    def _on_anchor(self, url):
+        s = url.toString()
+        if s.startswith("ask:"):
+            from urllib.parse import unquote
+            self._ask(unquote(s[4:]))
+        else:
+            try: QtGui.QDesktopServices.openUrl(url)
+            except Exception: pass
+
+    # ---------- raciocínio: erro → consultor → software → escalonar ----------
+    def _ask(self, text):
+        self._say("user", text)
+        up = text.upper()
+        mcode = re.search(r"\bE\d{3}\b", up)
+        if mcode and mcode.group() in ERROR_CATALOG:
+            code = mcode.group(); title, msg, _b = error_info(code)
+            self._say("assistant",
+                      f"<b>Erro {code} — {title}</b><br>{msg}", refs=None,
+                      follow=[("Ver todos os erros", "código de erro"),
+                              ("Onde fica o log", "onde fica o log de erros")])
+            return
+        # 1) Consultor metodológico (resposta focada e embasada)
+        c = consultor_answer(text)
+        if c and c["score"] >= 2:
+            self._say("assistant",
+                      f"{c['lead']}<br><br>{c['body_html']}",
+                      refs=c["refs"], follow=c["follow"])
+            return
+        # 2) Uso do software (FAQ + manual + erros), foco no melhor resultado
+        hits = help_answer(text, limit=3)
+        if hits:
+            title, ans, ref = hits[0]
+            dim = COLORS.get("text_dim", "#777")
+            body = f"<b>{title}</b><br>{ans}"
+            if ref:
+                body += f"<br><span style='color:{dim};font-size:11px'>↳ {ref}</span>"
+            extra = [(t2, f"{t2}") for t2, _a, _r in hits[1:3]]
+            fol = extra + [("Planejar um estudo",
+                            "como abordar estudo de membro superior")]
+            self._say("assistant", body, follow=fol)
+            return
+        # 3) fraco no consultor mas relevante? entrega mesmo assim
+        if c:
+            self._say("assistant",
+                      f"{c['lead']}<br><br>{c['body_html']}",
+                      refs=c["refs"], follow=c["follow"])
+            return
+        # 4) Não mapeado → escalonar com honestidade
+        acc = COLORS.get("accent", "#0f9d75")
+        self._say("assistant",
+                  "Ainda <b>não tenho esse tema mapeado</b> na minha base. Para não te "
+                  "dar informação genérica, prefiro ser honesto:<br>"
+                  "• Reformule com uma palavra-chave (ex.: <i>banda, trials, artefato, "
+                  "validação, topografia, exportar</i>), ou use os atalhos acima;<br>"
+                  "• Se for específico do seu <b>hardware/método</b>, fale com o "
+                  "<b>suporte/orientador</b> da equipe;<br>"
+                  f"• Como o OpenBionica é <b style='color:{acc}'>código aberto</b>, você "
+                  "(ou sua equipe) pode <b>implementar/corrigir</b> direto no código.",
+                  follow=[("Planejar um estudo (MS)",
+                           "como abordar estudo de membro superior"),
+                          ("Ver temas de metodologia", "metodologia"),
+                          ("Diagnóstico de erros", "código de erro")])
+
+
+# ============================================================
+# Area Maker — Receitas de analise (pipeline composavel, salvavel em .json)
+# ============================================================
+RECIPE_VERSION = "1.0"
+RECIPE_BANDS = dict(EEG_BANDS)
+RECIPE_BANDS["Mu (8-13)"] = (8.0, 13.0)
+RECIPE_METRICS = [("band", "Potência de banda"),
+                  ("erd", "ERD% vs baseline (imagética motora)"),
+                  ("relband", "Potência relativa da banda (%)"),
+                  ("rms", "RMS"),
+                  ("ptp", "Amplitude pico-a-pico"), ("std", "Desvio padrão")]
+
+# Métricas que usam o seletor de BANDA
+RECIPE_BAND_METRICS = {"band", "erd", "relband"}
+
+# Modelos prontos (estilo "cenários" do OpenVIBE) — embasados no guia.
+RECIPE_TEMPLATES = [
+    {"nome": "ERD Mu — imagética motora", "metrica": "erd", "banda": "Mu (8-13)",
+     "filtro": {"low": 8, "high": 30}, "baseline": {"b0": 0.0, "b1": 2.0},
+     "t0": 2.5, "t1": 4.5,
+     "_dica": "ERD% na banda mu (8–13 Hz): baseline 0–2 s (repouso) × janela de MI "
+              "2,5–4,5 s. Espere ERD negativo em C3/C4 [Pfurtscheller & Lopes da Silva 1999]."},
+    {"nome": "ERD Beta — imagética motora", "metrica": "erd", "banda": "Beta",
+     "filtro": {"low": 8, "high": 30}, "baseline": {"b0": 0.0, "b1": 2.0},
+     "t0": 2.5, "t1": 4.5,
+     "_dica": "ERD% em beta (13–30 Hz). Após o fim da MI costuma haver ERS "
+              "(beta rebound) — teste também uma janela pós-movimento."},
+    {"nome": "Potência relativa Alpha (relaxamento)", "metrica": "relband",
+     "banda": "Alpha", "filtro": {"low": 1, "high": 40},
+     "_dica": "Alpha relativo (% da potência total 1–40 Hz). Sobe no relaxamento / "
+              "olhos fechados, forte em região occipital."},
+    {"nome": "Potência relativa Beta (atenção/foco)", "metrica": "relband",
+     "banda": "Beta", "filtro": {"low": 1, "high": 40},
+     "_dica": "Beta relativo (%): tende a subir com atenção/engajamento."},
+    {"nome": "RMS bruto (qualidade do sinal)", "metrica": "rms",
+     "_dica": "Amplitude RMS por canal (µV): útil para triagem de canais ruins / "
+             "eletrodo solto (valores muito altos ou ~0)."},
+]
+
+
+def run_recipe(recipe, session):
+    """Pipeline de analise sobre uma sessao: RECORTE temporal -> PRE-FILTRO
+    (passa-banda) -> METRICA por canal. Retorna [(rotulo_canal, valor)]."""
+    eeg = np.asarray(session.get("eeg")) if session else None
+    if eeg is None or eeg.ndim != 2 or eeg.size == 0:
+        return []
+    sr = float(session.get("sr", SAMPLE_RATE))
+    names = session.get("ch_names") or [f"CH{i+1}" for i in range(eeg.shape[0])]
+    metric = recipe.get("metrica", "band")
+    band = recipe.get("banda", "Alpha")
+    sel = recipe.get("canais")
+    idxs = (list(range(eeg.shape[0])) if (not sel or sel == "all")
+            else [c for c in sel if 0 <= c < eeg.shape[0]])
+    # --- etapa: recorte temporal (segundos) ---
+    n_total = eeg.shape[1]
+    t0, t1 = recipe.get("t0"), recipe.get("t1")
+    i0 = int(max(0.0, float(t0)) * sr) if t0 not in (None, "") else 0
+    i1 = int(float(t1) * sr) if t1 not in (None, "") else n_total
+    i0 = max(0, min(i0, n_total)); i1 = max(i0, min(i1, n_total))
+    # --- etapa: janela de baseline (para ERD%) ---
+    bl = recipe.get("baseline") or {}
+    b0, b1 = bl.get("b0"), bl.get("b1")
+    j0 = int(float(b0) * sr) if b0 not in (None, "") else 0
+    j1 = int(float(b1) * sr) if b1 not in (None, "") else int(min(2.0 * sr, n_total))
+    j0 = max(0, min(j0, n_total)); j1 = max(j0 + 1, min(j1, n_total))
+    hi_tot = min(40.0, 0.49 * sr)   # banda "total" para potência relativa
+    # --- etapa: pre-filtro (passa-banda) ---
+    sos = None
+    filt = recipe.get("filtro")
+    if filt:
+        try:
+            ny = 0.5 * sr
+            lo_n = max(1e-4, float(filt.get("low", 0)) / ny)
+            hi_n = min(0.999, float(filt.get("high", 0)) / ny)
+            if 0 < lo_n < hi_n < 1:
+                sos = scipy_signal.butter(4, [lo_n, hi_n], btype="band", output="sos")
+        except Exception:
+            sos = None
+    out = []
+    for c in idxs:
+        chan = np.asarray(eeg[c], dtype=float)
+        sig = chan[i0:i1]; sig = sig[np.isfinite(sig)]
+        if sig.size < 2:
+            out.append((names[c], 0.0)); continue
+        if sos is not None and sig.size > 18:
+            try: sig = scipy_signal.sosfiltfilt(sos, sig)
+            except Exception: pass
+        # --- etapa: metrica ---
+        if metric == "band":
+            lo, hi = RECIPE_BANDS.get(band, (8.0, 13.0))
+            val = SignalProcessor.compute_band_power(sig, lo, hi, sr)
+        elif metric == "relband":                        # potência relativa (%)
+            lo, hi = RECIPE_BANDS.get(band, (8.0, 13.0))
+            pb = SignalProcessor.compute_band_power(sig, lo, hi, sr)
+            pt = SignalProcessor.compute_band_power(sig, 1.0, hi_tot, sr)
+            val = 100.0 * pb / pt if pt > 0 else 0.0
+        elif metric == "erd":                            # ERD% vs baseline
+            lo, hi = RECIPE_BANDS.get(band, (8.0, 13.0))
+            base = chan[j0:j1]; base = base[np.isfinite(base)]
+            if sos is not None and base.size > 18:
+                try: base = scipy_signal.sosfiltfilt(sos, base)
+                except Exception: pass
+            p_act = SignalProcessor.compute_band_power(sig, lo, hi, sr)
+            p_base = (SignalProcessor.compute_band_power(base, lo, hi, sr)
+                      if base.size >= 2 else 0.0)
+            val = 100.0 * (p_act - p_base) / p_base if p_base > 0 else 0.0
+        elif metric == "rms":
+            val = float(np.sqrt(np.mean(sig ** 2)))
+        elif metric == "ptp":
+            val = float(np.ptp(sig))
+        else:
+            val = float(np.std(sig))
+        out.append((names[c], float(val)))
+    return out
+
+
+class RecipeDialog(QtWidgets.QDialog):
+    """Area Maker (v1): monta uma RECEITA de analise (metrica + banda + canais),
+    roda em uma ou mais sessoes e salva/carrega como .json reutilizavel."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._win = parent
+        self._sessions = []   # [(nome, dict)]
+        self.setWindowTitle("Receitas de análise — Área Maker")
+        self.setMinimumSize(780, 600)
+        v = QtWidgets.QVBoxLayout(self)
+        v.addWidget(QtWidgets.QLabel(
+            "<b>Monte uma receita de análise</b> (recorte → filtro → métrica) e rode "
+            "em uma ou várias sessões. Métricas incluem <b>ERD%</b> e <b>potência "
+            "relativa</b>. Salve como <b>.json</b> para reutilizar/compartilhar o "
+            "protocolo (reprodutibilidade). Tudo offline."))
+        form = QtWidgets.QFormLayout()
+        # ---- modelos prontos (estilo "cenários" do OpenVIBE) ----
+        tpl_row = QtWidgets.QHBoxLayout()
+        self.tpl_combo = QtWidgets.QComboBox()
+        self.tpl_combo.addItem("— escolher um modelo —", None)
+        for t in RECIPE_TEMPLATES:
+            self.tpl_combo.addItem(t["nome"], t)
+        tpl_btn = QtWidgets.QPushButton("Aplicar modelo")
+        tpl_btn.clicked.connect(self._apply_template)
+        tpl_row.addWidget(self.tpl_combo, 1); tpl_row.addWidget(tpl_btn)
+        form.addRow("Modelo pronto:", tpl_row)
+        self.tpl_hint = QtWidgets.QLabel("")
+        self.tpl_hint.setWordWrap(True)
+        self.tpl_hint.setStyleSheet(f"color:{COLORS.get('text_dim','#777')};font-size:11px")
+        form.addRow("", self.tpl_hint)
+        self.name_edit = QtWidgets.QLineEdit("Minha análise")
+        form.addRow("Nome da receita:", self.name_edit)
+        self.metric_combo = QtWidgets.QComboBox()
+        for code, label in RECIPE_METRICS:
+            self.metric_combo.addItem(label, code)
+        self.metric_combo.currentIndexChanged.connect(self._sync_band)
+        form.addRow("Métrica:", self.metric_combo)
+        self.band_combo = QtWidgets.QComboBox()
+        for b in RECIPE_BANDS:
+            self.band_combo.addItem(b, b)
+        self.band_combo.setCurrentText("Alpha")
+        form.addRow("Banda:", self.band_combo)
+        self.chan_edit = QtWidgets.QLineEdit()
+        self.chan_edit.setPlaceholderText("vazio = todos os canais  ·  ou ex.: 1,2,3 (1-based)")
+        form.addRow("Canais:", self.chan_edit)
+        # etapa do pipeline: recorte temporal
+        cut = QtWidgets.QHBoxLayout()
+        self.t0_edit = QtWidgets.QLineEdit(); self.t0_edit.setPlaceholderText("início (s)")
+        self.t1_edit = QtWidgets.QLineEdit(); self.t1_edit.setPlaceholderText("fim (s)")
+        cut.addWidget(self.t0_edit); cut.addWidget(QtWidgets.QLabel("até"))
+        cut.addWidget(self.t1_edit)
+        form.addRow("Recorte (vazio = tudo):", cut)
+        # etapa do pipeline: pre-filtro (passa-banda)
+        fl = QtWidgets.QHBoxLayout()
+        self.filt_chk = QtWidgets.QCheckBox("Pré-filtrar")
+        self.filt_lo = QtWidgets.QLineEdit("1");  self.filt_lo.setMaximumWidth(60)
+        self.filt_hi = QtWidgets.QLineEdit("40"); self.filt_hi.setMaximumWidth(60)
+        fl.addWidget(self.filt_chk); fl.addWidget(self.filt_lo)
+        fl.addWidget(QtWidgets.QLabel("–")); fl.addWidget(self.filt_hi)
+        fl.addWidget(QtWidgets.QLabel("Hz")); fl.addStretch(1)
+        form.addRow("Pré-filtro (passa-banda):", fl)
+        # etapa do pipeline: baseline (só para ERD%)
+        bl = QtWidgets.QHBoxLayout()
+        self.b0_edit = QtWidgets.QLineEdit("0");   self.b0_edit.setMaximumWidth(60)
+        self.b1_edit = QtWidgets.QLineEdit("2");   self.b1_edit.setMaximumWidth(60)
+        bl.addWidget(self.b0_edit); bl.addWidget(QtWidgets.QLabel("até"))
+        bl.addWidget(self.b1_edit); bl.addWidget(QtWidgets.QLabel("s (repouso)"))
+        bl.addStretch(1)
+        self.baseline_row = QtWidgets.QWidget(); self.baseline_row.setLayout(bl)
+        form.addRow("Baseline p/ ERD%:", self.baseline_row)
+        v.addLayout(form)
+        sh = QtWidgets.QHBoxLayout()
+        add_btn = QtWidgets.QPushButton("Adicionar sessões…")
+        add_btn.clicked.connect(self._add_sessions)
+        clr_btn = QtWidgets.QPushButton("Limpar")
+        clr_btn.clicked.connect(self._clear_sessions)
+        self.sess_lbl = QtWidgets.QLabel("0 sessões")
+        sh.addWidget(add_btn); sh.addWidget(clr_btn); sh.addWidget(self.sess_lbl)
+        sh.addStretch(1)
+        v.addLayout(sh)
+        self.result_lbl = QtWidgets.QLabel("")
+        self.result_lbl.setStyleSheet(f"color:{COLORS.get('accent','#0f9d75')};"
+                                      "font-weight:bold")
+        v.addWidget(self.result_lbl)
+        self.table = QtWidgets.QTableWidget(0, 1)
+        self.table.setHorizontalHeaderLabels(["Canal"])
+        self.table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        v.addWidget(self.table, 1)
+        ah = QtWidgets.QHBoxLayout()
+        run_btn = QtWidgets.QPushButton("▶ Rodar"); run_btn.clicked.connect(self._run)
+        save_btn = QtWidgets.QPushButton("Salvar receita…"); save_btn.clicked.connect(self._save_recipe)
+        load_btn = QtWidgets.QPushButton("Carregar receita…"); load_btn.clicked.connect(self._load_recipe)
+        exp_btn = QtWidgets.QPushButton("Exportar tabela…"); exp_btn.clicked.connect(self._export_csv)
+        close_btn = QtWidgets.QPushButton("Fechar"); close_btn.clicked.connect(self.accept)
+        for b in (run_btn, save_btn, load_btn, exp_btn):
+            ah.addWidget(b)
+        ah.addStretch(1); ah.addWidget(close_btn)
+        v.addLayout(ah)
+        try: self.setStyleSheet(build_stylesheet(COLORS))
+        except Exception: pass
+        self._sync_band()
+
+    def _sync_band(self):
+        metric = self.metric_combo.currentData()
+        self.band_combo.setEnabled(metric in RECIPE_BAND_METRICS)
+        self.baseline_row.setEnabled(metric == "erd")
+
+    def _apply_template(self):
+        """Preenche o formulário a partir de um modelo pronto (RECIPE_TEMPLATES)."""
+        t = self.tpl_combo.currentData()
+        if not t:
+            self.tpl_hint.setText(""); return
+        self.name_edit.setText(t["nome"])
+        i = self.metric_combo.findData(t.get("metrica", "band"))
+        if i >= 0:
+            self.metric_combo.setCurrentIndex(i)
+        j = self.band_combo.findData(t.get("banda", "Alpha"))
+        if j >= 0:
+            self.band_combo.setCurrentIndex(j)
+        self.chan_edit.setText("")                     # modelos: todos os canais
+        self.t0_edit.setText("" if t.get("t0") in (None, "") else str(t["t0"]))
+        self.t1_edit.setText("" if t.get("t1") in (None, "") else str(t["t1"]))
+        filt = t.get("filtro") or {}
+        self.filt_chk.setChecked(bool(filt))
+        if filt:
+            self.filt_lo.setText(str(filt.get("low", "1")))
+            self.filt_hi.setText(str(filt.get("high", "40")))
+        base = t.get("baseline") or {}
+        if base:
+            self.b0_edit.setText(str(base.get("b0", "0")))
+            self.b1_edit.setText(str(base.get("b1", "2")))
+        self.tpl_hint.setText("💡 " + t.get("_dica", ""))
+        self._sync_band()
+
+    def _recipe(self):
+        chans = "all"
+        txt = self.chan_edit.text().strip()
+        if txt:
+            try:
+                chans = [int(x) - 1 for x in re.split(r"[,;\s]+", txt) if x.strip()]
+            except Exception:
+                chans = "all"
+        def _num(le):
+            t = le.text().strip().replace(",", ".")
+            try: return float(t) if t else None
+            except Exception: return None
+        rec = {"recipe_version": RECIPE_VERSION, "nome": self.name_edit.text().strip(),
+               "metrica": self.metric_combo.currentData(),
+               "banda": self.band_combo.currentData(), "canais": chans,
+               "t0": _num(self.t0_edit), "t1": _num(self.t1_edit)}
+        if self.filt_chk.isChecked():
+            lo, hi = _num(self.filt_lo), _num(self.filt_hi)
+            if lo is not None and hi is not None and hi > lo:
+                rec["filtro"] = {"low": lo, "high": hi}
+        if self.metric_combo.currentData() == "erd":
+            rec["baseline"] = {"b0": _num(self.b0_edit), "b1": _num(self.b1_edit)}
+        return rec
+
+    def _add_sessions(self):
+        if not hasattr(self._win, "_load_session_csv"):
+            return
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Selecionar sessões (CSV)", "", "CSV (*.csv)")
+        for p in paths:
+            try:
+                d = self._win._load_session_csv(p)
+                if d:
+                    self._sessions.append((os.path.basename(p), d))
+            except Exception as exc:
+                logging.getLogger("eeg").warning("receita: falha em %s: %s", p, exc)
+        self.sess_lbl.setText(f"{len(self._sessions)} sessões")
+
+    def _clear_sessions(self):
+        self._sessions = []
+        self.sess_lbl.setText("0 sessões")
+        self.table.setRowCount(0); self.table.setColumnCount(1)
+        self.table.setHorizontalHeaderLabels(["Canal"])
+
+    def _run(self):
+        if not self._sessions:
+            QtWidgets.QMessageBox.information(
+                self, "Receita", "Adicione ao menos uma sessão antes de rodar.")
+            return
+        rec = self._recipe()
+        results = [(nm, run_recipe(rec, d)) for nm, d in self._sessions]
+        if not results[0][1]:
+            QtWidgets.QMessageBox.information(
+                self, "Receita", "A receita não produziu resultados nessa sessão.")
+            return
+        metric = rec.get("metrica", "band")
+        unit = {"erd": "ERD% (negativo = dessincronização)",
+                "relband": "% da potência total (1–40 Hz)",
+                "band": "potência de banda (µV²)", "rms": "µV (RMS)",
+                "ptp": "µV (pico-a-pico)", "std": "µV (desvio padrão)"}.get(metric, "")
+        mlabel = dict(RECIPE_METRICS).get(metric, metric)
+        bandtxt = (f" · banda {rec.get('banda')}" if metric in RECIPE_BAND_METRICS
+                   else "")
+        self.result_lbl.setText(f"Métrica: {mlabel}{bandtxt}  —  unidade: {unit}")
+        chan_order = [c for c, _ in results[0][1]]
+        self.table.setColumnCount(1 + len(results))
+        self.table.setHorizontalHeaderLabels(["Canal"] + [nm for nm, _ in results])
+        self.table.setRowCount(len(chan_order))
+        for r, ch in enumerate(chan_order):
+            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(ch))
+            for ci, (_nm, rows) in enumerate(results):
+                val = dict(rows).get(ch)
+                it = QtWidgets.QTableWidgetItem(f"{val:.4g}" if isinstance(val, float) else "—")
+                it.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(r, 1 + ci, it)
+        self.table.resizeColumnsToContents()
+
+    def _save_recipe(self):
+        p, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Salvar receita",
+            (self.name_edit.text().strip() or "receita") + ".json", "Receita (*.json)")
+        if not p:
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(self._recipe(), f, ensure_ascii=False, indent=2)
+            QtWidgets.QMessageBox.information(self, "Receita", f"Receita salva:\n{p}")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Receita", f"Falha ao salvar: {exc}")
+
+    def _load_recipe(self):
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Carregar receita", "", "Receita (*.json)")
+        if not p:
+            return
+        try:
+            with open(p, encoding="utf-8") as f:
+                rec = json.load(f)
+            self.name_edit.setText(str(rec.get("nome", "")))
+            i = self.metric_combo.findData(rec.get("metrica", "band"))
+            if i >= 0:
+                self.metric_combo.setCurrentIndex(i)
+            j = self.band_combo.findData(rec.get("banda", "Alpha"))
+            if j >= 0:
+                self.band_combo.setCurrentIndex(j)
+            ch = rec.get("canais", "all")
+            self.chan_edit.setText("" if ch in (None, "all") else
+                                   ",".join(str(int(c) + 1) for c in ch))
+            self.t0_edit.setText("" if rec.get("t0") in (None, "") else str(rec["t0"]))
+            self.t1_edit.setText("" if rec.get("t1") in (None, "") else str(rec["t1"]))
+            filt = rec.get("filtro") or {}
+            self.filt_chk.setChecked(bool(filt))
+            if filt:
+                self.filt_lo.setText(str(filt.get("low", "1")))
+                self.filt_hi.setText(str(filt.get("high", "40")))
+            base = rec.get("baseline") or {}
+            if base:
+                self.b0_edit.setText("" if base.get("b0") in (None, "") else str(base["b0"]))
+                self.b1_edit.setText("" if base.get("b1") in (None, "") else str(base["b1"]))
+            self._sync_band()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Receita", f"Falha ao carregar: {exc}")
+
+    def _export_csv(self):
+        if self.table.rowCount() == 0:
+            QtWidgets.QMessageBox.information(self, "Receita", "Rode a receita primeiro.")
+            return
+        p, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Exportar tabela", "resultado_receita.csv", "CSV (*.csv)")
+        if not p:
+            return
+        try:
+            cols = [self.table.horizontalHeaderItem(c).text()
+                    for c in range(self.table.columnCount())]
+            with open(p, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f); w.writerow(cols)
+                for r in range(self.table.rowCount()):
+                    w.writerow([self.table.item(r, c).text() if self.table.item(r, c) else ""
+                                for c in range(self.table.columnCount())])
+            QtWidgets.QMessageBox.information(self, "Receita", f"Tabela exportada:\n{p}")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Receita", f"Falha: {exc}")
+
+
+# ============================================================
+# Logging de aplicacao + recuperacao de crash (qualidade comercial)
+# ============================================================
+def _setup_logging():
+    """Logging de SAUDE/ERROS do software (separado do audit de protocolo).
+    RotatingFileHandler em DOC_DIR/logs/app.log (5MB x3) + console."""
+    logger = logging.getLogger("eeg")
+    if logger.handlers:                       # idempotente
+        return logger
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+    try:
+        log_dir = os.path.join(DOC_DIR, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(
+            os.path.join(log_dir, "app.log"),
+            maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except Exception as exc:
+        print(f"[logging] nao foi possivel criar o arquivo de log: {exc}")
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    logger.propagate = False
+    return logger
+
+
+def _install_excepthook(logger):
+    """Handler GLOBAL de excecoes: em vez de o app cair em silencio (no .exe nao
+    ha console), loga o traceback completo e mostra um dialogo amigavel com a
+    opcao de ver os detalhes/abrir o relatorio."""
+    def _hook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        logger.critical("Excecao nao tratada:",
+                        exc_info=(exc_type, exc_value, exc_tb))
+        try:
+            short = "".join(
+                traceback.format_exception_only(exc_type, exc_value)).strip()
+            # Sinaliza como "Erro E999" (catalogo), com traceback nos detalhes
+            notify_error("E999", detail=short, exc=exc_value)
+        except Exception:
+            pass
+    sys.excepthook = _hook
+    try:
+        import faulthandler
+        faulthandler.enable()                 # travamentos em C (numpy/scipy/Qt)
+    except Exception:
+        pass
+
+
+# ============================================================
 # Entry point
 # ============================================================
 def main():
@@ -14182,6 +17797,11 @@ def main():
     app.setStyle("Fusion")
     # Fonte global da interface (Inter — UI). Widgets de dados redefinem para JetBrains Mono via QSS.
     app.setFont(QtGui.QFont(FONT_UI, 10))
+
+    # Logging de aplicacao + rede de seguranca contra crash silencioso
+    logger = _setup_logging()
+    logger.info("Iniciando %s v%s", APP_NAME, APP_VERSION)
+    _install_excepthook(logger)
 
     # ----------------------------------------------------------------
     # IMPORTANTE: carrega config.json e aplica o tema salvo ANTES de
@@ -14198,6 +17818,20 @@ def main():
         THEMES[_name] = _palette
     # Se o tema salvo for um custom, aplica de fato suas cores
     if early_config.theme in THEMES:
+        _apply_theme_colors(early_config.theme)
+
+    # ---- Assistente de primeiro uso (idioma -> layout -> aceite do Termo) ----
+    # Reaparece se o termo nunca foi aceito OU se a versao do termo mudou.
+    needs_wizard = ((not early_config.terms_accepted)
+                    or (early_config.terms_version != TERMS_VERSION))
+    if needs_wizard and "--no-wizard" not in sys.argv:
+        app.setStyleSheet(build_stylesheet(COLORS))   # estilo p/ o assistente
+        wiz = FirstRunWizard(early_config)
+        if wiz.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            logger.info("Termo de uso recusado pelo usuário — encerrando.")
+            sys.exit(0)                                # sem consentimento -> nao abre
+        # O assistente pode ter trocado idioma/layout e ja salvou o config.
+        I18N.set_language(getattr(early_config, "language", "pt"))
         _apply_theme_colors(early_config.theme)
 
     # Configura pyqtgraph com cores ja corretas (evita flash em plots)
